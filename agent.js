@@ -123,7 +123,7 @@ Default project alias: "${projectAlias || 'default'}". Always start with list_re
   let edited = false;
   let published = false;
   let publishRetries = 0;
-  const MAX_PUBLISH_RETRIES = 3;
+  let writtenFiles = []; // track files we've written so we can auto-upload
 
   for (let turn = 0; turn < CONFIG.maxTurns; turn++) {
     const response = await callModel(messages, tools);
@@ -158,6 +158,30 @@ Default project alias: "${projectAlias || 'default'}". Always start with list_re
       let args = {};
       try { args = JSON.parse(tc.function?.arguments || '{}'); } catch {}
       if (!args.project && projectAlias) args.project = projectAlias;
+
+      // Track written files for auto-upload
+      if (name === 'write_file' && args.path) {
+        writtenFiles.push(args.path);
+        edited = true;
+      }
+
+      // If downloading a file we already wrote, auto-upload it instead
+      if (name === 'download_file' && args.path && writtenFiles.includes(args.path)) {
+        console.log(`   ⚡ Auto-uploading ${args.path} (already written, skipping download)...`);
+        try {
+          const uploadRes = await mcpClient.callTool({ name: 'upload_file', arguments: { project: projectAlias, path: args.path, revision: args.revision } });
+          const uploadText = uploadRes.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+          console.log(`   ↳ ${uploadText.slice(0, 200)}`);
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: uploadText });
+          edited = true;
+          // Now force publish
+          messages.push({ role: 'user', content: `File uploaded. Now call finish_revision and set_current_revision to publish. Use revision=${args.revision} for both.` });
+        } catch (err) {
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: `Upload error: ${err.message}` });
+        }
+        continue;
+      }
+
       if (MUTATING.has(name)) edited = true;
       if (name === 'finish_revision') published = true;
 
@@ -260,13 +284,17 @@ function addToQueue(state, comment) {
   const author = comment.author?.username || '';
   const content = extractCommentText(comment);
 
-  // Skip empty or already queued
   if (!content.trim()) return;
   if (state.queue.find(q => q.commentId === comment.id)) return;
 
+  // ── Admin commands (Endoxidev only) ──
+  if (author === 'Endoxidev' && content.startsWith('!')) {
+    handleAdminCommand(content, comment, state);
+    return;
+  }
+
   const item = { commentId: comment.id, author, content: content.slice(0, 200), addedAt: new Date().toISOString() };
 
-  // Endoxidev always jumps to front
   if (author === 'Endoxidev') {
     state.queue.unshift(item);
     console.log(`   ⭐ @Endoxidev → queue position #1 (priority)`);
@@ -274,6 +302,46 @@ function addToQueue(state, comment) {
     state.queue.push(item);
     const pos = state.queue.length;
     console.log(`   📥 @${author} → queue position #${pos}`);
+  }
+}
+
+async function handleAdminCommand(content, comment, state) {
+  const cmd = content.trim().toLowerCase();
+  const projectAlias = state._projectAlias || 'opus48';
+  const WIP = '⚠️ *Admin command received.*\n\n';
+
+  if (cmd === '!clearqueue' || cmd === '!clear') {
+    const count = state.queue.length;
+    // Notify everyone being removed
+    for (const item of state.queue) {
+      try {
+        await mcpClient.callTool({ name: 'post_reply', arguments: {
+          project: projectAlias, comment_id: item.commentId,
+          content: `${WIP}The build queue has been cleared by the admin. Your request has been removed. Feel free to resubmit!`,
+        }});
+        await new Promise(r => setTimeout(r, 1000)); // rate limit
+      } catch {}
+    }
+    state.queue = [];
+    state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
+    console.log(`   🔧 Admin: queue cleared (${count} items removed + notified)`);
+    // Acknowledge the command
+    try {
+      await mcpClient.callTool({ name: 'post_reply', arguments: {
+        project: projectAlias, comment_id: comment.id,
+        content: `${WIP}✅ Queue cleared! ${count} items removed. All users have been notified. Queue is now empty.`,
+      }});
+    } catch {}
+  } else if (cmd === '!status') {
+    try {
+      await mcpClient.callTool({ name: 'post_reply', arguments: {
+        project: projectAlias, comment_id: comment.id,
+        content: `${WIP}📊 Queue: ${state.queue.length} waiting | Built: ${state.checklist.length} items | Currently: ${state.currentlyProcessing ? 'building' : 'idle'}`,
+      }});
+    } catch {}
+    console.log(`   🔧 Admin: status reported (${state.queue.length} in queue)`);
+  } else {
+    console.log(`   ⚠️ Unknown admin command: ${cmd}`);
   }
 }
 
