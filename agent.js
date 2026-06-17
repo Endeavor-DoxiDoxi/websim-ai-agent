@@ -1,9 +1,6 @@
 #!/usr/bin/env node
 /**
- * websim AI agent v2.1 — Queue-based daemon
- * 
- * Processes edits ONE AT A TIME in FIFO order (Endoxidev always front).
- * Announces queue positions every minute so users don't spam-repeat requests.
+ * websim AI agent v2.2 — instant queue alerts + background announcements
  */
 
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
@@ -12,15 +9,14 @@ const fs = require('fs');
 const nodePath = require('path');
 require('dotenv').config();
 
-// ── Config ─────────────────────────────────────────────────────────
 const CONFIG = {
   baseUrl:   (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, ''),
   apiKey:    process.env.OPENAI_API_KEY || '',
-  model:     'claude-opus-4-8-20260501', // force Opus 4.8
+  model:     'claude-opus-4-8-20260501',
   maxTurns:  parseInt(process.env.AGENT_MAX_TURNS || '15', 10),
   debug:     process.env.AGENT_DEBUG === 'true',
   watchIntervalMs: parseInt(process.env.AGENT_WATCH_INTERVAL_SECONDS || '10', 10) * 1000,
-  queueAnnounceMs: 60000, // announce positions every 60s
+  queueAnnounceMs: 30000, // re-announce positions every 30s for all waiting
   botUsername: process.env.WEBSIM_BOT_USERNAME || 'Opus_4_8',
 };
 
@@ -45,7 +41,6 @@ function loadProjectsConfig() {
   catch { return { projects: {}, defaultProject: null }; }
 }
 
-// ── MCP Connection ─────────────────────────────────────────────────
 let mcpClient = null;
 let mcpTransport = null;
 let mcpTools = [];
@@ -56,11 +51,10 @@ async function startMCP() {
     env: { ...process.env }, stderr: 'pipe',
   });
   mcpTransport.stderr?.on('data', d => { const m = d.toString().trim(); if (m) console.error('[mcp]', m); });
-  mcpClient = new Client({ name: 'websim-agent', version: '2.1.0' }, { capabilities: {} });
+  mcpClient = new Client({ name: 'websim-agent', version: '2.2.0' }, { capabilities: {} });
   await mcpClient.connect(mcpTransport);
   const r = await mcpClient.listTools();
   mcpTools = r.tools || [];
-  log(`Connected. ${mcpTools.length} tools.`);
 }
 
 async function stopMCP() {
@@ -68,7 +62,6 @@ async function stopMCP() {
   mcpClient = null; mcpTransport = null; mcpTools = [];
 }
 
-// ── Tool conversion ────────────────────────────────────────────────
 function mcpToolToOpenAI(tool) {
   const props = {}, required = [];
   if (tool.inputSchema?.properties) {
@@ -81,7 +74,6 @@ function mcpToolToOpenAI(tool) {
   return { type: 'function', function: { name: tool.name, description: tool.description || '', parameters: { type: 'object', properties: props, required } } };
 }
 
-// ── API call ───────────────────────────────────────────────────────
 async function callModel(messages, tools) {
   const body = { model: CONFIG.model, messages, max_tokens: 4096 };
   if (tools && tools.length > 0) { body.tools = tools; body.tool_choice = 'auto'; }
@@ -99,31 +91,28 @@ async function callModel(messages, tools) {
 async function runAgent(prompt, projectAlias) {
   const tools = mcpTools.map(mcpToolToOpenAI);
   const guide = loadClaudeGuide();
-  const guideSection = guide ? `\n\nGUIDE (from CLAUDE.md):\n${guide.slice(0, 3000)}\n` : '';
+  const guideSection = guide ? `\n\nGUIDE:\n${guide.slice(0, 3000)}\n` : '';
   const messages = [
-    { role: 'system', content: `You edit a websim.com project. Use TOOLS — never just describe changes in prose. Only upload_file + finish_revision + set_current_revision actually change the live project.
+    { role: 'system', content: `You edit a websim.com project. Use TOOLS — never describe changes in prose.
 
 WORKFLOW:
-1. list_revisions → find latest version
-2. create_revision(parent_version=latest) → new draft
-3. download_file → read current contents (returned inline)
-4. write_file → stage your edits locally
-5. upload_file → push to websim
-6. finish_revision → publish (MANDATORY after uploading!)
-7. set_current_revision → make it live
-Then stop and give a 1-2 sentence summary.
+1. list_revisions → find latest
+2. create_revision(parent_version=latest) → draft
+3. download_file → read contents
+4. write_file → stage edits
+5. upload_file → push
+6. finish_revision → publish (MANDATORY!)
+7. set_current_revision → make live
+Stop and give 1-2 sentence summary.
 
-Default project alias: "${projectAlias || 'default'}". Always start with list_revisions.${guideSection}` },
+Project: "${projectAlias || 'default'}". Always start with list_revisions.${guideSection}` },
     { role: 'user', content: prompt },
   ];
 
   console.log(`\n🤖 Building: "${prompt.slice(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
 
   const MUTATING = new Set(['upload_file', 'finish_revision', 'set_current_revision', 'delete_file', 'create_revision']);
-  let edited = false;
-  let published = false;
-  let publishRetries = 0;
-  let writtenFiles = []; // track files we've written so we can auto-upload
+  let edited = false, published = false, publishRetries = 0, writtenFiles = [];
 
   for (let turn = 0; turn < CONFIG.maxTurns; turn++) {
     const response = await callModel(messages, tools);
@@ -132,23 +121,17 @@ Default project alias: "${projectAlias || 'default'}". Always start with list_re
     const toolCalls = msg.tool_calls || [];
 
     if (toolCalls.length === 0) {
-      if (edited && !published && publishRetries < MAX_PUBLISH_RETRIES) {
+      if (edited && !published && publishRetries < 3) {
         publishRetries++;
-        console.log(`   ⚠️ NOT published (attempt ${publishRetries}/${MAX_PUBLISH_RETRIES}) — forcing finish_revision.`);
-        // Force the exact tool calls needed — bypass LLM indecision
-        const draftMsg = messages.filter(m => m.role === 'assistant' && m.tool_calls?.some(tc => tc.function?.name === 'create_revision')).pop();
-        let revNum = 'latest';
-        messages.push({ role: 'user', content: `CRITICAL: You have uploaded files but not published. You MUST call these tools NOW, in this exact order:\n\n1. <tool_call>finish_revision with revision=the draft revision number you created</tool_call>\n2. <tool_call>set_current_revision with revision=same number</tool_call>\n\nDO NOT download or write anything else. JUST FINISH AND PUBLISH.` });
+        console.log(`   ⚠️ Not published (retry ${publishRetries}/3)`);
+        messages.push({ role: 'user', content: 'Call finish_revision then set_current_revision NOW. Do NOT download anything else.' });
         continue;
-      }
-      if (edited && !published && publishRetries >= MAX_PUBLISH_RETRIES) {
-        console.log('   ⚠️ Max publish retries reached — continuing anyway.');
       }
       const summary = (msg.content || '').trim();
       if (summary) console.log(summary.slice(0, 400));
       messages.push({ role: 'assistant', content: summary });
-      console.log(edited ? '✅ Published live.' : '⚠️ No changes made.');
-      return { ok: edited, summary, edited };
+      console.log(edited ? (published ? '✅ Published.' : '⚠️ Uploaded but not published.') : '⚠️ No changes.');
+      return { ok: edited && published, summary, edited };
     }
 
     messages.push({ role: 'assistant', content: msg.content || null, tool_calls: toolCalls });
@@ -159,54 +142,43 @@ Default project alias: "${projectAlias || 'default'}". Always start with list_re
       try { args = JSON.parse(tc.function?.arguments || '{}'); } catch {}
       if (!args.project && projectAlias) args.project = projectAlias;
 
-      // Track written files for auto-upload
-      if (name === 'write_file' && args.path) {
-        writtenFiles.push(args.path);
-        edited = true;
-      }
+      if (name === 'write_file' && args.path) { writtenFiles.push(args.path); edited = true; }
 
-      // If downloading a file we already wrote, auto-upload it instead
+      // Auto-upload: if downloading a file we already wrote, upload instead
       if (name === 'download_file' && args.path && writtenFiles.includes(args.path)) {
-        console.log(`   ⚡ Auto-uploading ${args.path} (already written, skipping download)...`);
+        console.log(`   ⚡ Auto-uploading ${args.path}...`);
         try {
           const uploadRes = await mcpClient.callTool({ name: 'upload_file', arguments: { project: projectAlias, path: args.path, revision: args.revision } });
           const uploadText = uploadRes.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
           console.log(`   ↳ ${uploadText.slice(0, 200)}`);
           messages.push({ role: 'tool', tool_call_id: tc.id, content: uploadText });
+          messages.push({ role: 'user', content: `Uploaded ${args.path}. Now call finish_revision and set_current_revision.` });
           edited = true;
-          // Now force publish
-          messages.push({ role: 'user', content: `File uploaded. Now call finish_revision and set_current_revision to publish. Use revision=${args.revision} for both.` });
-        } catch (err) {
-          messages.push({ role: 'tool', tool_call_id: tc.id, content: `Upload error: ${err.message}` });
-        }
+        } catch (err) { messages.push({ role: 'tool', tool_call_id: tc.id, content: `Error: ${err.message}` }); }
         continue;
       }
 
       if (MUTATING.has(name)) edited = true;
       if (name === 'finish_revision') published = true;
-
       console.log(`   🔧 ${name}(${JSON.stringify(args).slice(0, 100)})`);
       let result;
       try {
         const res = await mcpClient.callTool({ name, arguments: args });
         result = res.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
         console.log(`   ↳ ${result.slice(0, 200)}`);
-      } catch (err) {
-        result = `Error: ${err.message}`;
-        console.error(`   ❌ ${err.message}`);
-      }
+      } catch (err) { result = `Error: ${err.message}`; console.error(`   ❌ ${err.message}`); }
       messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
     }
   }
   console.log(`⚠️ Max turns (${CONFIG.maxTurns}) reached.`);
-  return { ok: edited, summary: '', edited };
+  return { ok: edited && published, summary: '', edited };
 }
 
 // ── CLAUDE.md loader ───────────────────────────────────────────────
 let _claudeGuide = '';
 function loadClaudeGuide() {
   if (_claudeGuide) return _claudeGuide;
-  try { _claudeGuide = fs.readFileSync(nodePath.join(__dirname, 'CLAUDE.md'), 'utf8'); log('Loaded CLAUDE.md'); }
+  try { _claudeGuide = fs.readFileSync(nodePath.join(__dirname, 'CLAUDE.md'), 'utf8'); }
   catch { _claudeGuide = ''; }
   return _claudeGuide;
 }
@@ -224,36 +196,22 @@ function extractCommentText(comment) {
 }
 
 // ── Triage ─────────────────────────────────────────────────────────
-const TRIAGE_SYSTEM_PROMPT = `You triage comments for a websim project. Decide if a comment is worth building.
+const TRIAGE_PROMPT = `You triage comments for a websim project. Decide if a comment is worth building.
 
-Respond JSON ONLY:
-{
-  "category": "feature_request|bug_fix|ui_change|content_change|question|praise|spam|abuse|greeting|unclear",
-  "actionable": true,
-  "reasoning": "why",
-  "decisionReply": "public reply — friendly, 1-3 sentences",
-  "editPrompt": "precise implementation instructions if actionable"
-}
+Reply JSON ONLY:
+{"category":"feature_request|bug_fix|ui_change|content_change|question|praise|spam|abuse|greeting|unclear","actionable":true/false,"reasoning":"why","decisionReply":"friendly public reply","editPrompt":"precise instructions if actionable"}
 
-RULES:
-- Default to actionable unless clearly spam/abuse
-- Vague requests: interpret generously
-- Questions: answer helpfully, redirect to builds
-- Greetings: welcome, ask what to build
-- Link-only/no-content: spam`;
+Default to actionable. Interpret vaguely but generously. Greetings → welcome + ask what to build. Questions → answer. Links-only → spam.`;
 
 async function triageComment(comment) {
   const content = extractCommentText(comment);
-  const author = comment.author?.username || comment.profiles?.username || 'someone';
-
+  const author = comment.author?.username || 'someone';
   const guide = loadClaudeGuide();
   const ctx = guide ? `\nPROJECT CONTEXT:\n${guide.slice(0, 3000)}` : '';
-
   const res = await callModel([
-    { role: 'system', content: TRIAGE_SYSTEM_PROMPT + ctx },
-    { role: 'user', content: `Comment from @${author}: ${content}` },
+    { role: 'system', content: TRIAGE_PROMPT + ctx },
+    { role: 'user', content: `From @${author}: ${content}` },
   ], []);
-
   try {
     const d = JSON.parse((res.choices?.[0]?.message?.content||'').replace(/```json|```/g, '').trim());
     return { category: d.category||'unclear', actionable: !!d.actionable, reasoning: d.reasoning||'', decisionReply: d.decisionReply||'', editPrompt: d.editPrompt||'' };
@@ -264,14 +222,12 @@ async function triageComment(comment) {
 
 // ── Daemon State ───────────────────────────────────────────────────
 const BOT_STATE_PATH = nodePath.join(__dirname, 'comment-bot-seen.json');
-const STATE_MAX_AGE_DAYS = parseInt(process.env.AGENT_STATE_MAX_AGE_DAYS || '90', 10);
-
 function loadBotState() {
   try {
     const s = JSON.parse(fs.readFileSync(BOT_STATE_PATH, 'utf8'));
-    if (!s.entries) s.entries = {};
-    if (!s.queue) s.queue = [];
-    if (!s.checklist) s.checklist = [];
+    s.entries = s.entries || {};
+    s.queue = s.queue || [];
+    s.checklist = s.checklist || [];
     return s;
   } catch {
     return { entries: {}, queue: [], checklist: [], currentlyProcessing: null, lastAnnounce: null, lastRun: null };
@@ -280,78 +236,74 @@ function loadBotState() {
 function saveBotState(state) { fs.writeFileSync(BOT_STATE_PATH, JSON.stringify(state, null, 2)); }
 
 // ── Queue System ───────────────────────────────────────────────────
+
+// Fire-and-forget reply helper (never blocks)
+function bgReply(projectAlias, commentId, content) {
+  mcpClient.callTool({ name: 'post_reply', arguments: { project: projectAlias, comment_id: commentId, content } }).catch(() => {});
+}
+
 function addToQueue(state, comment) {
   const author = comment.author?.username || '';
   const content = extractCommentText(comment);
-
   if (!content.trim()) return;
   if (state.queue.find(q => q.commentId === comment.id)) return;
+  if (state.entries[comment.id]?.category === 'cleared') return;
 
-  // ── Admin commands (Endoxidev only) ──
+  // Admin commands (Endoxidev only)
   if (author === 'Endoxidev' && content.startsWith('!')) {
     handleAdminCommand(content, comment, state);
     return;
   }
 
   const item = { commentId: comment.id, author, content: content.slice(0, 200), addedAt: new Date().toISOString() };
+  author === 'Endoxidev' ? state.queue.unshift(item) : state.queue.push(item);
 
-  if (author === 'Endoxidev') {
-    state.queue.unshift(item);
-    console.log(`   ⭐ @Endoxidev → queue position #1 (priority)`);
-  } else {
-    state.queue.push(item);
-    const pos = state.queue.length;
-    console.log(`   📥 @${author} → queue position #${pos}`);
-  }
+  const pos = state.queue.indexOf(item) + 1;
+  const total = state.queue.length;
+  console.log(`   ${author === 'Endoxidev' ? '⭐' : '📥'} @${author} → queue #${pos}/${total}`);
+
+  // IMMEDIATE queue alert — first reply, non-blocking
+  const quote = RANDOM_QUOTES[Math.floor(Math.random() * RANDOM_QUOTES.length)];
+  const statusLine = (pos === 1 && state.currentlyProcessing) ? `**#1** — currently being built! 🔨` : `**#${pos}** of ${total}`;
+  bgReply(state._projectAlias || 'opus48', comment.id,
+    `⚠️ *Heads up — heavy work in progress!*\n\nYour spot in the generation queue: ${statusLine}. Please be patient!\n\n> ${quote}`);
 }
 
 async function handleAdminCommand(content, comment, state) {
   const cmd = content.trim().toLowerCase();
-  const projectAlias = state._projectAlias || 'opus48';
+  const proj = state._projectAlias || 'opus48';
   const WIP = '⚠️ *Admin command received.*\n\n';
 
   if (cmd === '!clearqueue' || cmd === '!clear') {
     const count = state.queue.length;
-    // Mark all queued entries as 'cleared' so they're never re-processed
+    console.log(`   🔧 !clearqueue: clearing ${count} items...`);
+
+    // Mark all queued entries as 'cleared' so they never re-process
     for (const item of state.queue) {
-      if (state.entries[item.commentId]) {
-        state.entries[item.commentId].category = 'cleared';
-        state.entries[item.commentId].clearedAt = new Date().toISOString();
-      } else {
-        state.entries[item.commentId] = { id: item.commentId, category: 'cleared', at: new Date().toISOString() };
-      }
+      state.entries[item.commentId] = { id: item.commentId, category: 'cleared', at: new Date().toISOString() };
     }
-    // Clear in-progress state
     state.currentlyProcessing = null;
-    // Notify everyone being removed (rate limited: 1s between each)
+
+    // Notify each removed user (rate-limited: 1s apart)
     for (const item of state.queue) {
-      try {
-        await mcpClient.callTool({ name: 'post_reply', arguments: {
-          project: projectAlias, comment_id: item.commentId,
-          content: `⚠️ *The build queue has been cleared by the admin.*\n\nYour request has been removed from the queue. Feel free to resubmit by posting a new comment!`,
-        }});
-        await new Promise(r => setTimeout(r, 1000));
-      } catch {}
+      bgReply(proj, item.commentId, `⚠️ *Build queue cleared by admin.*\n\nYour request (${item.content.slice(0, 60)}...) has been removed. Feel free to resubmit with a new comment!`);
+      await new Promise(r => setTimeout(r, 1000));
     }
+
     state.queue = [];
-    console.log(`   🔧 !clearqueue: ${count} items cleared, notified, and marked as 'cleared' in state`);
-    saveBotState(state);
-    // Acknowledge
-    try {
-      await mcpClient.callTool({ name: 'post_reply', arguments: {
-        project: projectAlias, comment_id: comment.id,
-        content: `✅ **Queue cleared!** ${count} items removed, all users notified. Queue is empty.\n\nTip: comments marked as "cleared" won't be re-processed even on restart. Users must post new comments to re-enter the queue.`,
-      }});
-    } catch {}
     state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
+    saveBotState(state);
+
+    bgReply(proj, comment.id, `✅ **Queue cleared!** ${count} items removed, all ${count} users notified.\n\nComments marked as cleared won't re-process. Post new comments to re-enter the queue.`);
+    console.log(`   🔧 Queue cleared: ${count} items removed + notified`);
+
   } else if (cmd === '!status') {
-    try {
-      await mcpClient.callTool({ name: 'post_reply', arguments: {
-        project: projectAlias, comment_id: comment.id,
-        content: `${WIP}📊 Queue: ${state.queue.length} waiting | Built: ${state.checklist.length} items | Currently: ${state.currentlyProcessing ? 'building' : 'idle'}`,
-      }});
-    } catch {}
-    console.log(`   🔧 Admin: status reported (${state.queue.length} in queue)`);
+    const s = state.queue.length;
+    const b = state.checklist.length;
+    const cp = state.currentlyProcessing ? 'building' : 'idle';
+    bgReply(proj, comment.id, `📊 **Status:** ${s} in queue | ${b} built | Currently: ${cp}`);
+    state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
+    console.log(`   🔧 !status: ${s} queued, ${b} built, ${cp}`);
   } else {
     console.log(`   ⚠️ Unknown admin command: ${cmd}`);
   }
@@ -361,23 +313,17 @@ async function announceQueuePositions(projectAlias, state) {
   if (state.queue.length === 0) return;
   const now = Date.now();
   const last = state.lastAnnounce ? new Date(state.lastAnnounce).getTime() : 0;
-  // Only announce if enough time passed OR queue just changed (caller sets lastAnnounce=null to force)
-  if (now - last < CONFIG.queueAnnounceMs && last !== 0) return;
+  if (now - last < CONFIG.queueAnnounceMs && state.queue.length > 0 && last > 0) return;
 
-  console.log(`   📢 Announcing queue (${state.queue.length} waiting)...`);
+  console.log(`   📢 Announcing positions to ${state.queue.length} waiting...`);
   const WIP = '⚠️ *Heads up — heavy work in progress!*\n\n';
 
   for (let i = 0; i < state.queue.length; i++) {
     const item = state.queue[i];
     const quote = RANDOM_QUOTES[Math.floor(Math.random() * RANDOM_QUOTES.length)];
-    const statusLine = i === 0 && state.currentlyProcessing
-      ? `**#${i + 1}** — currently being built! 🔨`
-      : `**#${i + 1}** of ${state.queue.length}`;
-    const msg = `${WIP}Your spot in the generation queue: ${statusLine}. Please be patient!\n\n> ${quote}`;
-    try {
-      await mcpClient.callTool({ name: 'post_reply', arguments: { project: projectAlias, comment_id: item.commentId, content: msg } });
-    } catch {}
-    if (i < state.queue.length - 1) await new Promise(r => setTimeout(r, 1500)); // rate limit
+    const statusLine = (i === 0 && state.currentlyProcessing) ? `**#1** — currently being built! 🔨` : `**#${i + 1}** of ${state.queue.length}`;
+    bgReply(projectAlias, item.commentId, `${WIP}Your spot in the generation queue: ${statusLine}. Please be patient!\n\n> ${quote}`);
+    await new Promise(r => setTimeout(r, 1500)); // rate limit between replies
   }
 
   state.lastAnnounce = new Date().toISOString();
@@ -385,61 +331,56 @@ async function announceQueuePositions(projectAlias, state) {
 }
 
 async function processNextInQueue(projectAlias, state) {
-  if (state.queue.length === 0) return;
-  if (state.currentlyProcessing) return; // already working on something
+  if (state.queue.length === 0 || state.currentlyProcessing) return;
 
   const item = state.queue.shift();
   state.currentlyProcessing = item.commentId;
+  state.entries[item.commentId] = { id: item.commentId, category: 'processing', at: new Date().toISOString(), author: item.author, snippet: item.content.slice(0, 120) };
   saveBotState(state);
 
-  console.log(`\n🛠️  Processing queue #1 (was waiting): @${item.author}: "${item.content.slice(0, 80)}..."`);
+  // Announce updated positions (now that #1 is being processed)
+  announceQueuePositions(projectAlias, state).catch(() => {});
 
-  // Triage + Build
-  const comment = { id: item.commentId, content: item.content, raw_content: item.content, author: { username: item.author } };
+  console.log(`\n🛠️  Processing: @${item.author}: "${item.content.slice(0, 80)}..."`);
 
   const WIP = '⚠️ *Heads up — heavy work in progress! Pardon our dust.*\n\n';
+  const comment = { id: item.commentId, content: item.content, raw_content: item.content, author: { username: item.author } };
 
+  // Triage
   console.log('   🧠 Reasoning...');
   const decision = await triageComment(comment);
-
   const emojis = { feature_request:'✨', bug_fix:'🐛', ui_change:'🎨', content_change:'✏️', question:'❓', praise:'❤️', spam:'🗑️', abuse:'🚫', greeting:'👋', unclear:'🤷' };
   console.log(`   ${emojis[decision.category]||'📌'} ${decision.category} → ${decision.actionable ? 'BUILD' : 'PASS'}`);
   console.log(`   ↳ ${decision.reasoning}`);
 
   // Reply with decision
-  try {
-    const reply = WIP + (decision.decisionReply || (decision.actionable ? "Great idea! I'll build this now." : "Thanks for the comment!"));
-    await mcpClient.callTool({ name: 'post_reply', arguments: { project: projectAlias, comment_id: item.commentId, content: reply } });
-    console.log('   💬 Decision reply sent.');
-  } catch (err) { console.error(`   ⚠️ Reply failed: ${err.message}`); }
+  bgReply(projectAlias, item.commentId, WIP + (decision.decisionReply || (decision.actionable ? "Great idea! I'll build this now." : "Thanks for the comment!")));
+  console.log('   💬 Decision reply sent.');
 
-  // Build if actionable
+  // Build
   if (decision.actionable && decision.editPrompt) {
-    console.log(`   🛠️  Building...`);
+    console.log('   🛠️  Building...');
     try {
       const result = await runAgent(decision.editPrompt, projectAlias);
       state.checklist.push({ what: decision.editPrompt, category: decision.category, commentId: item.commentId, author: item.author, at: new Date().toISOString() });
-      state.entries[item.commentId] = { id: item.commentId, category: decision.category, at: new Date().toISOString(), reasoning: decision.reasoning, built: result.ok };
-
-      const done = `${WIP}✅ Done! Refresh to see the changes.\n\n> ${decision.reasoning}\n\nLet me know if you want tweaks!`;
-      await mcpClient.callTool({ name: 'post_reply', arguments: { project: projectAlias, comment_id: item.commentId, content: done } });
-      console.log('   ✅ Build complete + done reply.');
+      state.entries[item.commentId].built = result.ok;
+      state.entries[item.commentId].builtAt = new Date().toISOString();
+      bgReply(projectAlias, item.commentId, `${WIP}✅ Done! Refresh to see the changes.\n\n> ${decision.reasoning}\n\nLet me know if you want tweaks!`);
+      console.log('   ✅ Build complete.');
     } catch (err) {
       console.error(`   ❌ Build failed: ${err.message}`);
-      try {
-        await mcpClient.callTool({ name: 'post_reply', arguments: { project: projectAlias, comment_id: item.commentId, content: `${WIP}😅 Hit a snag: ${err.message.slice(0, 150)}. Trying a different approach...` } });
-      } catch {}
+      state.entries[item.commentId].buildError = err.message.slice(0, 200);
+      bgReply(projectAlias, item.commentId, `${WIP}😅 Hit a snag: ${err.message.slice(0, 150)}. Moving on...`);
     }
   }
 
-  state.entries[item.commentId] = state.entries[item.commentId] || { id: item.commentId, category: decision.category, at: new Date().toISOString() };
   state.currentlyProcessing = null;
   saveBotState(state);
 
-  // Immediately process next if any, and announce updated positions
+  // Process next + announce updated positions
   if (state.queue.length > 0) {
-    console.log(`   📋 ${state.queue.length} more in queue — updated positions sent.`);
-    await announceQueuePositions(projectAlias, state);
+    console.log(`   📋 ${state.queue.length} remaining — announcing + processing next...`);
+    announceQueuePositions(projectAlias, state).catch(() => {});
     await processNextInQueue(projectAlias, state);
   }
 }
@@ -447,26 +388,23 @@ async function processNextInQueue(projectAlias, state) {
 // ── Daemon Loop ────────────────────────────────────────────────────
 async function daemonLoop(projectAlias) {
   const state = loadBotState();
-  // Clear any stale processing state from crash
+  state._projectAlias = projectAlias;
   if (state.currentlyProcessing) state.currentlyProcessing = null;
   saveBotState(state);
 
-  const intervalSec = Math.round(CONFIG.watchIntervalMs / 1000);
-  console.log(`\n🤖 Daemon v2.1 started | Model: ${CONFIG.model} | Poll: ${intervalSec}s | Queue announce: ${CONFIG.queueAnnounceMs/1000}s`);
-  console.log(`   Queue: ${state.queue.length} waiting | Built: ${state.checklist.length} items | Priority: @Endoxidev\n`);
+  const intSec = Math.round(CONFIG.watchIntervalMs / 1000);
+  console.log(`\n🤖 Daemon v2.2 | Model: ${CONFIG.model} | Poll: ${intSec}s | Priority: @Endoxidev`);
+  console.log(`   Queue: ${state.queue.length} | Built: ${state.checklist.length} | Admin: !clearqueue, !status\n`);
 
   await pollAndEnqueue(projectAlias, state);
 
-  // Poll loop
   const pollTimer = setInterval(() => pollAndEnqueue(projectAlias, state), CONFIG.watchIntervalMs);
-  // Announce loop
   const announceTimer = setInterval(() => announceQueuePositions(projectAlias, state), CONFIG.queueAnnounceMs);
 
   let closing = false;
   const shutdown = async () => {
     if (closing) return; closing = true;
-    clearInterval(pollTimer);
-    clearInterval(announceTimer);
+    clearInterval(pollTimer); clearInterval(announceTimer);
     state.currentlyProcessing = null;
     saveBotState(state);
     await stopMCP();
@@ -486,7 +424,6 @@ async function pollAndEnqueue(projectAlias, state) {
 
     const foreign = comments.filter(c => (c.author?.username || '') !== CONFIG.botUsername);
     const selfCount = comments.length - foreign.length;
-
     const newComments = foreign.filter(c => !state.entries[c.id] && !state.queue.find(q => q.commentId === c.id));
 
     for (const c of newComments) {
@@ -495,54 +432,43 @@ async function pollAndEnqueue(projectAlias, state) {
     }
     saveBotState(state);
 
-    // Announce positions to everyone who just joined + announce if queue is non-empty
     if (newComments.length > 0) {
       const sn = selfCount > 0 ? ` (${selfCount} self skipped)` : '';
       console.log(`[${ts}] ${newComments.length} new → queue now ${state.queue.length}${sn}`);
-      // Immediately announce positions to everyone waiting
-      await announceQueuePositions(projectAlias, state);
+      // Announce positions immediately when queue changes
+      announceQueuePositions(projectAlias, state).catch(() => {});
     }
 
-    // Try to process next item
     if (!state.currentlyProcessing && state.queue.length > 0) {
       await processNextInQueue(projectAlias, state);
     }
 
     state.lastRun = new Date().toISOString();
     saveBotState(state);
-  } catch (err) {
-    console.error(`[${ts}] ⚠️ ${err.message}`);
-  }
+  } catch (err) { console.error(`[${ts}] ⚠️ ${err.message}`); }
 }
 
 // ── Main ────────────────────────────────────────────────────────────
 async function main() {
   const args = process.argv.slice(2);
-  let projectAlias = null, prompt = '', interactive = false, watch = false, listProjects = false;
+  let projectAlias = null, prompt = '', interactive = false, watch = false;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--project' || args[i] === '-p') projectAlias = args[++i];
-    else if (args[i] === '--interactive' || args[i] === '-i') interactive = true;
     else if (args[i] === '--watch' || args[i] === '-w' || args[i] === '--daemon') watch = true;
-    else if (args[i] === '--list-projects') listProjects = true;
-    else if (args[i] === '--help' || args[i] === '-h') { console.log('USAGE: node agent.js [--watch] [--project <alias>] [--interactive] ["prompt"]'); process.exit(0); }
-    else prompt += (prompt ? ' ' : '') + args[i];
+    else if (args[i] === '--list-projects') {
+      const c = loadProjectsConfig();
+      console.log(JSON.stringify(Object.entries(c.projects||{}).map(([k,v])=>({alias:k,id:v.id,slug:v.slug})),null,2));
+      process.exit(0);
+    }
+    else prompt += (prompt?' ':'') + args[i];
   }
 
-  if (listProjects) {
-    const c = loadProjectsConfig();
-    console.log(JSON.stringify(Object.entries(c.projects||{}).map(([k,v])=>({alias:k,id:v.id,slug:v.slug,label:v.label,isDefault:k===c.defaultProject})),null,2));
-    process.exit(0);
-  }
-  if (!CONFIG.apiKey) { console.error('❌ OPENAI_API_KEY not set in .env'); process.exit(1); }
-
-  try { await startMCP(); } catch (err) { console.error('❌ MCP failed:', err.message); process.exit(1); }
-
+  if (!CONFIG.apiKey) { console.error('❌ OPENAI_API_KEY not set'); process.exit(1); }
+  try { await startMCP(); } catch (err) { console.error('❌ MCP:', err.message); process.exit(1); }
   process.on('SIGINT', async () => { await stopMCP(); process.exit(0); });
 
   if (watch) { await daemonLoop(projectAlias); return; }
-  if (interactive || !prompt) { console.log('Interactive mode — not implemented in v2.1. Use --watch for daemon.'); await stopMCP(); return; }
-
   try { await runAgent(prompt, projectAlias); } catch (err) { console.error(`\n❌ ${err.message}`); } finally { await stopMCP(); }
 }
 
