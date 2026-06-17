@@ -502,8 +502,9 @@ async function triageComment(comment, state) {
   const content = extractCommentText(comment);
   const author = comment.author?.username || comment.profiles?.username || comment.user_id || 'someone';
 
-  // Fast pre-check: if we've seen this exact comment ID, skip
-  if (state.entries[comment.id]) {
+  // Fast pre-check: if we've seen this exact comment ID AND it's not just 'processing', skip
+  const existing = state.entries[comment.id];
+  if (existing && existing.category !== 'processing') {
     return { category: 'already_seen', actionable: false, shouldReply: false, reason: 'already processed' };
   }
 
@@ -561,7 +562,7 @@ async function actionComment(projectAlias, comment, state) {
   // still replying/building (builds take minutes) can't re-trigger this same
   // comment and double-reply. Re-entrancy guard is the real fix for the
   // "replies multiple times in a row" loop.
-  if (state.entries[commentId]) return; // already claimed by a prior cycle
+  if (state.entries[commentId] && state.entries[commentId]?.category !== 'processing') return; // already fully processed
   state.entries[commentId] = { id: commentId, category: 'processing', at: new Date().toISOString(), author };
   saveBotState(state);
 
