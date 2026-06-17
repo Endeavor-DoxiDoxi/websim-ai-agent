@@ -312,26 +312,38 @@ async function handleAdminCommand(content, comment, state) {
 
   if (cmd === '!clearqueue' || cmd === '!clear') {
     const count = state.queue.length;
-    // Notify everyone being removed
+    // Mark all queued entries as 'cleared' so they're never re-processed
+    for (const item of state.queue) {
+      if (state.entries[item.commentId]) {
+        state.entries[item.commentId].category = 'cleared';
+        state.entries[item.commentId].clearedAt = new Date().toISOString();
+      } else {
+        state.entries[item.commentId] = { id: item.commentId, category: 'cleared', at: new Date().toISOString() };
+      }
+    }
+    // Clear in-progress state
+    state.currentlyProcessing = null;
+    // Notify everyone being removed (rate limited: 1s between each)
     for (const item of state.queue) {
       try {
         await mcpClient.callTool({ name: 'post_reply', arguments: {
           project: projectAlias, comment_id: item.commentId,
-          content: `${WIP}The build queue has been cleared by the admin. Your request has been removed. Feel free to resubmit!`,
+          content: `⚠️ *The build queue has been cleared by the admin.*\n\nYour request has been removed from the queue. Feel free to resubmit by posting a new comment!`,
         }});
-        await new Promise(r => setTimeout(r, 1000)); // rate limit
+        await new Promise(r => setTimeout(r, 1000));
       } catch {}
     }
     state.queue = [];
-    state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
-    console.log(`   🔧 Admin: queue cleared (${count} items removed + notified)`);
-    // Acknowledge the command
+    console.log(`   🔧 !clearqueue: ${count} items cleared, notified, and marked as 'cleared' in state`);
+    saveBotState(state);
+    // Acknowledge
     try {
       await mcpClient.callTool({ name: 'post_reply', arguments: {
         project: projectAlias, comment_id: comment.id,
-        content: `${WIP}✅ Queue cleared! ${count} items removed. All users have been notified. Queue is now empty.`,
+        content: `✅ **Queue cleared!** ${count} items removed, all users notified. Queue is empty.\n\nTip: comments marked as "cleared" won't be re-processed even on restart. Users must post new comments to re-enter the queue.`,
       }});
     } catch {}
+    state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
   } else if (cmd === '!status') {
     try {
       await mcpClient.callTool({ name: 'post_reply', arguments: {
