@@ -2,6 +2,11 @@
 
 # Notice - BUILT ON LINUX, YOU MIGHT WANNA USE A BASH SHELL FOR WINDOWS, OR WSL2 FOR NOW.
 
+# Double Notice - It has a queuing system, idk, theres still some rate limiting issues I think.
+
+# Triple Notice 
+### TO THE WEBSIM DEVS, IF THIS PROJECT IS AN ISSUE TORWARDS THE WEBSIM SERVICE, API, OR USERS IN ANY WAY, YOU MAY REQUEST THAT THIS PROJECT BE PRIVATED OR REMOVED IMMEDIATELY UNTIL SAFE TO USE AGAIN. THIS IS TO ENSURE THAT NOTHING GOES WRONG, THE MAIN REPO WILL BE REMOVED UNTIL ALLOWED ONCE AGAIN.
+
 ## Before you go all "YOU LEAKED AN API KEY"
 <img width="930" height="207" alt="image" src="https://github.com/user-attachments/assets/ab028f28-fe58-4dc6-b59d-fe3d5f8ae500" />
 
