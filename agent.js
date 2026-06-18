@@ -295,11 +295,13 @@ function loadBotState() {
 }
 function saveBotState(state) { fs.writeFileSync(BOT_STATE_PATH, JSON.stringify(state, null, 2)); }
 
-function recoverInterruptedProcessing(state) {
+function recoverInterruptedProcessing(state, interruptedId) {
+  if (!interruptedId) return 0;
   const queued = new Set((state.queue || []).map(item => item.commentId));
   let recovered = 0;
   for (const entry of Object.values(state.entries || {})) {
     if (!entry || entry.category !== 'processing') continue;
+    if (entry.id !== interruptedId) continue;
     if (entry.builtAt || entry.buildError || queued.has(entry.id)) continue;
     const content = entry.content || entry.snippet;
     if (!content) continue;
@@ -622,8 +624,9 @@ async function processNextInQueue(projectAlias, state) {
 async function daemonLoop(projectAlias) {
   const state = loadBotState();
   state._projectAlias = projectAlias;
+  const interruptedId = state.currentlyProcessing;
   if (state.currentlyProcessing) state.currentlyProcessing = null;
-  const recovered = recoverInterruptedProcessing(state);
+  const recovered = recoverInterruptedProcessing(state, interruptedId);
   saveBotState(state);
 
   const intSec = Math.round(CONFIG.watchIntervalMs / 1000);
