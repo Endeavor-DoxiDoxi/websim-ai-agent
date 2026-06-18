@@ -1,6 +1,12 @@
 # secrets
 .env
+.env.*
+!.env.example
 *.secret
+*.key
+*.pem
+*.p12
+*.pfx
 
 # dependencies
 node_modules/
@@ -8,8 +14,12 @@ node_modules/
 # project mirrors (downloaded from websim)
 project/
 
-# agent state
+# agent state / runtime output
 comment-bot-seen.json
+*.log
+*.pid
+*.bak
+*.tmp
 
 # OS junk
 .DS_Store

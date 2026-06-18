@@ -35,7 +35,7 @@ function loadConfig() {
 loadConfig();
 
 function getProject(alias) {
-  const key = alias || config.defaultProject;
+  const key = !alias || alias === 'default' ? config.defaultProject : alias;
   const proj = config.projects?.[key];
   if (!proj) throw new Error(`Unknown project alias "${key}". Available: ${Object.keys(config.projects || {}).join(', ')}`);
   return { alias: key, ...proj };
@@ -103,7 +103,7 @@ async function assetExists(projectId, revision, path, token) {
 const server = new McpServer({ name: 'websim-multi-project', version: '2.0.0' });
 
 // Project param schema reused across tools
-const projectParam = z.string().optional().describe('Project alias from projects.config.json. Uses defaultProject if omitted.');
+const projectParam = z.string().nullish().describe('Project alias from projects.config.json. Uses defaultProject if omitted.');
 
 // ── Local file writing (for LLM to stage edits) ────────────────────
 
@@ -121,6 +121,33 @@ server.tool(
     await fs.promises.mkdir(nodePath.dirname(dest), { recursive: true });
     await fs.promises.writeFile(dest, content, 'utf8');
     return { content: [{ type: 'text', text: `[${proj.alias}] Wrote ${content.length} bytes → ${dest}` }] };
+  }
+);
+
+server.tool(
+  'replace_in_file',
+  'Replace exact text in a downloaded local file (project/<alias>/<path>). Prefer this over write_file for small edits so the model does not need to emit an entire HTML file.',
+  {
+    path: z.string().describe('File path within the project, already downloaded to project/<alias>/<path>.'),
+    oldText: z.string().describe('Exact text to replace. Must occur exactly once.'),
+    newText: z.string().describe('Replacement text.'),
+    project: projectParam,
+  },
+  async ({ path, oldText, newText, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const dest = nodePath.join(PROJECT_DIR, proj.alias, path);
+    let content;
+    try {
+      content = await fs.promises.readFile(dest, 'utf8');
+    } catch {
+      throw new Error(`replace_in_file failed: local file not found at ${dest} — call download_file first`);
+    }
+    const first = content.indexOf(oldText);
+    if (first === -1) throw new Error('replace_in_file failed: oldText not found');
+    if (content.indexOf(oldText, first + oldText.length) !== -1) throw new Error('replace_in_file failed: oldText occurs more than once; provide a larger unique block');
+    const next = content.slice(0, first) + newText + content.slice(first + oldText.length);
+    await fs.promises.writeFile(dest, next, 'utf8');
+    return { content: [{ type: 'text', text: `[${proj.alias}] Replaced ${oldText.length} chars with ${newText.length} chars in ${path}` }] };
   }
 );
 
@@ -191,8 +218,9 @@ server.tool(
     await fs.promises.mkdir(nodePath.dirname(dest), { recursive: true });
     await fs.promises.writeFile(dest, buf);
     // Return file contents so the LLM can edit them
-    const preview = buf.toString('utf8').slice(0, 8000);
-    const truncated = buf.length > 8000 ? '\n... [truncated, full file on disk]' : '';
+    const previewLimit = 60000;
+    const preview = buf.toString('utf8').slice(0, previewLimit);
+    const truncated = buf.length > previewLimit ? '\n... [truncated, full file on disk]' : '';
     return { content: [{ type: 'text', text: `[${proj.alias}] Downloaded ${path} (${buf.length} bytes)\n\nFILE CONTENTS:\n${preview}${truncated}` }] };
   }
 );

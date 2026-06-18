@@ -12,8 +12,9 @@ require('dotenv').config();
 const CONFIG = {
   baseUrl:   (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, ''),
   apiKey:    process.env.OPENAI_API_KEY || '',
-  model:     'claude-opus-4-8-20260501',
+  model:     process.env.OPENAI_MODEL || '',
   maxTurns:  parseInt(process.env.AGENT_MAX_TURNS || '15', 10),
+  apiTimeoutMs: parseInt(process.env.AGENT_API_TIMEOUT_SECONDS || '60', 10) * 1000,
   debug:     process.env.AGENT_DEBUG === 'true',
   watchIntervalMs: parseInt(process.env.AGENT_WATCH_INTERVAL_SECONDS || '10', 10) * 1000,
   queueAnnounceMs: 30000, // re-announce positions every 30s for all waiting
@@ -77,14 +78,42 @@ function mcpToolToOpenAI(tool) {
 async function callModel(messages, tools) {
   const body = { model: CONFIG.model, messages, max_tokens: 4096 };
   if (tools && tools.length > 0) { body.tools = tools; body.tool_choice = 'auto'; }
-  const res = await fetch(CONFIG.baseUrl + '/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${CONFIG.apiKey}` },
-    body: JSON.stringify(body),
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`API ${res.status}: ${text.slice(0, 300)}`);
-  return JSON.parse(text);
+  const ctrl = new AbortController();
+  const started = Date.now();
+  const timeoutSec = Math.round(CONFIG.apiTimeoutMs / 1000);
+  console.log(`   🌐 model call → ${CONFIG.model} (${tools?.length || 0} tools, timeout ${timeoutSec}s)`);
+
+  let timer;
+  try {
+    const fetchPromise = fetch(CONFIG.baseUrl + '/chat/completions', {
+      method: 'POST',
+      signal: ctrl.signal,
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${CONFIG.apiKey}` },
+      body: JSON.stringify(body),
+    });
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        ctrl.abort();
+        reject(new Error(`API timeout after ${timeoutSec}s`));
+      }, CONFIG.apiTimeoutMs);
+    });
+    const res = await Promise.race([fetchPromise, timeoutPromise]);
+    const text = await Promise.race([
+      res.text(),
+      new Promise((_, reject) => setTimeout(() => {
+        ctrl.abort();
+        reject(new Error(`API body timeout after ${timeoutSec}s`));
+      }, CONFIG.apiTimeoutMs))
+    ]);
+    console.log(`   🌐 model response ← ${res.status} (${Date.now() - started}ms)`);
+    if (!res.ok) throw new Error(`API ${res.status}: ${text.slice(0, 300)}`);
+    return JSON.parse(text);
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error(`API timeout after ${timeoutSec}s`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ── Agent loop ─────────────────────────────────────────────────────
@@ -99,7 +128,7 @@ WORKFLOW:
 1. list_revisions → find latest
 2. create_revision(parent_version=latest) → draft
 3. download_file → read contents
-4. write_file → stage edits
+4. For small edits, prefer replace_in_file → stage exact local patches. Use write_file only when replacing/creating a whole file.
 5. upload_file → push
 6. finish_revision → publish (MANDATORY!)
 7. set_current_revision → make live
@@ -111,7 +140,7 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions.${guid
 
   console.log(`\n🤖 Building: "${prompt.slice(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
 
-  const MUTATING = new Set(['upload_file', 'finish_revision', 'set_current_revision', 'delete_file', 'create_revision']);
+  const MUTATING = new Set(['upload_file', 'finish_revision', 'set_current_revision', 'delete_file', 'create_revision', 'replace_in_file']);
   let edited = false, published = false, publishRetries = 0, writtenFiles = [];
 
   for (let turn = 0; turn < CONFIG.maxTurns; turn++) {
@@ -297,13 +326,13 @@ async function handleAdminCommand(content, comment, state) {
     bgReply(proj, comment.id, `✅ **Queue cleared!** ${count} items removed, all ${count} users notified.\n\nComments marked as cleared won't re-process. Post new comments to re-enter the queue.`);
     console.log(`   🔧 Queue cleared: ${count} items removed + notified`);
 
-  } else if (cmd === '!status') {
+  } else if (cmd === '!status' || cmd === '!stats') {
     const s = state.queue.length;
     const b = state.checklist.length;
     const cp = state.currentlyProcessing ? 'building' : 'idle';
     bgReply(proj, comment.id, `📊 **Status:** ${s} in queue | ${b} built | Currently: ${cp}`);
     state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
-    console.log(`   🔧 !status: ${s} queued, ${b} built, ${cp}`);
+    console.log(`   🔧 ${cmd}: ${s} queued, ${b} built, ${cp}`);
   } else {
     console.log(`   ⚠️ Unknown admin command: ${cmd}`);
   }
@@ -394,7 +423,7 @@ async function daemonLoop(projectAlias) {
 
   const intSec = Math.round(CONFIG.watchIntervalMs / 1000);
   console.log(`\n🤖 Daemon v2.2 | Model: ${CONFIG.model} | Poll: ${intSec}s | Priority: @Endoxidev`);
-  console.log(`   Queue: ${state.queue.length} | Built: ${state.checklist.length} | Admin: !clearqueue, !status\n`);
+  console.log(`   Queue: ${state.queue.length} | Built: ${state.checklist.length} | Admin: !clearqueue, !status, !stats\n`);
 
   await pollAndEnqueue(projectAlias, state);
 
@@ -451,7 +480,7 @@ async function pollAndEnqueue(projectAlias, state) {
 // ── Main ────────────────────────────────────────────────────────────
 async function main() {
   const args = process.argv.slice(2);
-  let projectAlias = null, prompt = '', interactive = false, watch = false;
+  let projectAlias = undefined, prompt = '', interactive = false, watch = false;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--project' || args[i] === '-p') projectAlias = args[++i];
@@ -465,6 +494,7 @@ async function main() {
   }
 
   if (!CONFIG.apiKey) { console.error('❌ OPENAI_API_KEY not set'); process.exit(1); }
+  if (!CONFIG.model) { console.error('❌ OPENAI_MODEL not set'); process.exit(1); }
   try { await startMCP(); } catch (err) { console.error('❌ MCP:', err.message); process.exit(1); }
   process.on('SIGINT', async () => { await stopMCP(); process.exit(0); });
 

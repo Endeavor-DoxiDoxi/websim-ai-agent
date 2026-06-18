@@ -17,7 +17,7 @@
 ```
 $ node agent.js "Add a dark mode toggle to my platformer"
 🤖 Agent: Working on "Add a dark mode toggle to my platformer"
-   Model: claude-opus-4-5-20251001 | Project: main | Max turns: 15
+   Model: your-model-id | Project: main | Max turns: 15
 
 🔧 Calling: list_revisions({"project":"main"})
    ↳ [main] Revisions: [{"version":5,"draft":false,...}]
@@ -60,9 +60,9 @@ Edit `.env`:
 
 ```ini
 # Your OpenAI-compatible endpoint (proxy, OpenAI, OpenRouter, etc.)
-OPENAI_BASE_URL=https://funny.doxi.dpdns.org/v1 # Very funny, yes you can still list models without auth at /models lol
-OPENAI_API_KEY=YOUR_API_KEY # KEY WAS REVOKED AHH
-OPENAI_MODEL=claude-opus-4-5-20251001
+OPENAI_BASE_URL=https://your-openai-compatible-endpoint/v1
+OPENAI_API_KEY=REPLACE_ME
+OPENAI_MODEL=your-model-id
 
 # Does your endpoint support image/vision input?
 OPENAI_VISION_SUPPORT=false
@@ -136,7 +136,7 @@ OPTIONS:
 $ node agent.js -i
 
 🔌 websim AI agent — interactive mode
-   Model: claude-opus-4-5-20251001 | Endpoint: https://funny.doxi.dpdns.org/v1
+   Model: your-model-id | Endpoint: https://your-openai-compatible-endpoint/v1
    Type "exit" to quit, "projects" to list projects.
 
 💬 You > add a jump counter to my platformer
@@ -157,9 +157,10 @@ The agent follows this workflow automatically:
 2. `create_revision(parent_version=live)` → new editable draft
 3. `download_file` → pull files locally
 4. *(LLM reviews + plans changes)*
-5. `upload_file` → push edited files
-6. `finish_revision` → publish (makes it immutable)
-7. `set_current_revision` → make new version live
+5. `replace_in_file` or `write_file` → stage local edits
+6. `upload_file` → push edited files
+7. `finish_revision` → publish (makes it immutable)
+8. `set_current_revision` → make new version live
 
 It can also do simpler tasks like reading files, listing revisions, posting/replying to comments, etc.
 
@@ -173,6 +174,7 @@ The MCP server exposes these tools (the agent converts them to OpenAI function f
 | `list_revisions` | List all revisions of a project |
 | `list_files` | List files in a specific revision |
 | `download_file` | Download a file to local `project/` mirror |
+| `replace_in_file` | Apply exact local text replacements after downloading a file |
 | `upload_file` | Upload a local file to websim |
 | `delete_file` | Delete a file from a revision |
 | `create_revision` | Create a new draft revision |
@@ -207,7 +209,7 @@ The MCP server can be used standalone with any MCP-compatible client (Claude Cod
 
 The agent sends standard OpenAI chat-completions requests with `tools`. It works with:
 
-- **Any OpenAI-compatible proxy** (like `funny.doxi.dpdns.org/v1`)
+- **Any OpenAI-compatible proxy**
 - **OpenAI** (api.openai.com)
 - **OpenRouter** (openrouter.ai/api/v1)
 - **Local models** (Ollama, LM Studio, vLLM via their OpenAI-compat endpoints)
