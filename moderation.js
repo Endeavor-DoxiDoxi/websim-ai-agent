@@ -16,6 +16,7 @@ const BLOCKED_CLASSES = new Set(['Sexy', 'Porn', 'Hentai']);
 const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|avif)(?:[?#][^\s"'<>)]*)?$/i;
 const VIDEO_EXT_RE = /\.(mp4|webm|mov|m4v|avi|mkv)(?:[?#][^\s"'<>)]*)?$/i;
 const URL_RE = /https?:\/\/[^\s"'<>)]*/gi;
+const MARKDOWN_IMAGE_RE = /!\[[^\]]*\]\((https?:\/\/[^\s"'<>)]*)\)/gi;
 
 const BLOCK_MESSAGE = 'Blocked for user safety (Please note: this detection is not 100 percent accurate. This affects prompts with images and videos. In the future, a new filtering system might be added, but for now, please understand not all images and videos will be allowed through.)';
 const moderationCache = new Map();
@@ -54,9 +55,12 @@ function extractUrls(text) {
 
 function extractMediaUrls(text) {
   const urls = extractUrls(text);
+  const markdownImages = unique([...String(text || '').matchAll(MARKDOWN_IMAGE_RE)].map((m) => m[1].replace(/[.,;:!?]+$/, '')));
+  const markdownSet = new Set(markdownImages);
   return urls.map((url) => {
     if (IMAGE_EXT_RE.test(url)) return { type: 'image', url };
     if (VIDEO_EXT_RE.test(url)) return { type: 'video', url };
+    if (markdownSet.has(url) || /\/blobs\//i.test(new URL(url).pathname)) return { type: 'unknown', url };
     return null;
   }).filter(Boolean);
 }
@@ -119,6 +123,29 @@ async function preflightRemoteMedia(url, type, cfg) {
   const max = type === 'video' ? cfg.maxVideoBytes : cfg.maxImageBytes;
   if (bytes > max) throw new Error(`${type} is too large (${bytes} bytes > ${max} bytes)`);
   return { bytes, contentType };
+}
+
+
+async function preflightUnknownMedia(url, cfg) {
+  await validateRemoteUrl(url, cfg);
+  const res = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(cfg.timeoutMs), redirect: 'follow' });
+  if (!res.ok) throw new Error(`HEAD failed (${res.status})`);
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  if (contentType.startsWith('image/')) {
+    const len = res.headers.get('content-length');
+    const bytes = len ? Number.parseInt(len, 10) : null;
+    if (!Number.isFinite(bytes)) throw new Error('image size could not be verified');
+    if (bytes > cfg.maxImageBytes) throw new Error(`image is too large (${bytes} bytes > ${cfg.maxImageBytes} bytes)`);
+    return 'image';
+  }
+  if (contentType.startsWith('video/') || contentType.split(';', 1)[0].trim() === 'application/octet-stream') {
+    const len = res.headers.get('content-length');
+    const bytes = len ? Number.parseInt(len, 10) : null;
+    if (!Number.isFinite(bytes)) throw new Error('video size could not be verified');
+    if (bytes > cfg.maxVideoBytes) throw new Error(`video is too large (${bytes} bytes > ${cfg.maxVideoBytes} bytes)`);
+    return 'video';
+  }
+  throw new Error(`unknown media URL has non-media content-type ${contentType || 'missing'}`);
 }
 
 async function classifyImageUrl(url, cfg) {
@@ -242,11 +269,12 @@ async function moderateTextForMedia(text, options = {}) {
   const results = [];
   for (const item of media) {
     try {
-      const result = item.type === 'video' ? await moderateVideo(item.url, cfg) : await moderateImage(item.url, cfg);
+      const resolvedType = item.type === 'unknown' ? await preflightUnknownMedia(item.url, cfg) : item.type;
+      const result = resolvedType === 'video' ? await moderateVideo(item.url, cfg) : await moderateImage(item.url, cfg);
       results.push(result);
       if (!result.ok) return { ok: false, blocked: item.url, result, message: BLOCK_MESSAGE, results };
     } catch (err) {
-      const label = item.type === 'video' ? 'Video' : 'Image';
+      const label = item.type === 'video' ? 'Video' : (item.type === 'image' ? 'Image' : 'Media');
       return { ok: false, blocked: item.url, reason: `${label} could not be verified: ${err.message}`, message: BLOCK_MESSAGE, results };
     }
   }
@@ -272,4 +300,5 @@ module.exports = {
   moderateTextForMedia,
   moderationConfig,
   preflightRemoteMedia,
+  preflightUnknownMedia,
 };

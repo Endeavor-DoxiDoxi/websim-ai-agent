@@ -27,7 +27,7 @@ assert(mcp.includes('set_current_revision verification failed'), 'set_current_re
 assert(mcp.includes('revision ${revision} is still draft'), 'set_current_revision must reject draft revisions');
 assert(mcp.includes('previous live revision'), 'safe mode response must report previous live revision');
 
-const media = moderation.extractMediaUrls('x https://example.com/a.mp4 and https://example.com/b.jpg');
-assert.deepStrictEqual(media.map(m => m.type), ['video', 'image']);
+const media = moderation.extractMediaUrls('x https://example.com/a.mp4 and https://example.com/b.jpg and ![](https://api.websim.com/blobs/abc123)');
+assert.deepStrictEqual(media.map(m => m.type), ['video', 'image', 'unknown']);
 
 console.log('static checks passed');
