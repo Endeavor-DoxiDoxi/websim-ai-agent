@@ -89,3 +89,7 @@ assert(mcp.includes('render_hyperframes_video'), 'MCP must render Hyperframes co
 assert(mcp.includes('Buffer.isBuffer(content)'), 'binary asset uploads must not be UTF-8 corrupted');
 assert(mcp.includes("mp4: 'video/mp4'"), 'video uploads must use video MIME types');
 assert(agent.includes('render_hyperframes_video'), 'agent prompt/tool flow must expose rendered Hyperframes video path');
+
+
+assert(agent.includes('If asked to test both Hyperframes integrations'), 'agent must have explicit both-integrations test instruction');
+assert(agent.includes('render_hyperframes_video fails'), 'agent must have render failure fallback behavior');

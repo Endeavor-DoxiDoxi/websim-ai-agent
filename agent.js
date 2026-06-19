@@ -150,6 +150,8 @@ HYPERFRAMES VIDEO SUPPORT:
 - Hyperframes is NOT an AI model. It is deterministic HTML/CSS/media animation code that can either be published directly as an interactive composition OR rendered to a real video file.
 - Hyperframes compositions use plain HTML attributes such as data-composition-id, data-start, data-duration, data-width, data-height, seekable CSS/JS animations, and normal web media tracks.
 - Choose based on the request: if the user wants an actual playable/exported video, write a composition directory (for example hyperframes/index.html), call render_hyperframes_video to create/upload an MP4/WebM, then put a normal <video> element in index.html.
+- If asked to test both Hyperframes integrations, do NOT explain or defer: create one page with (A) a direct/interactive Hyperframes-style composition section and (B) a rendered MP4/WebM produced via render_hyperframes_video and embedded with <video controls>. Finish and promote the test revision.
+- If render_hyperframes_video fails, fix the composition and retry once; if it still fails, publish the direct integration plus a visible error panel explaining the render failure.
 - If the user wants interactive/HTML motion graphics, publishing Hyperframes-style HTML/JS/CSS directly is okay.
 - Keep generated video code teen-safe and avoid adding remote media unless clearly necessary and safe.
 ` : '';
@@ -163,7 +165,7 @@ WORKFLOW:
 2. create_revision(parent_version=current live version) → draft
 3. download_file → read contents
 4. For small edits, prefer replace_in_file → stage exact local patches. Use write_file only when replacing/creating a whole file.
-5. For rendered video requests, call render_hyperframes_video before publishing. Otherwise upload_file → push every staged file needed by the page.
+5. For rendered video requests, call render_hyperframes_video before publishing. Use update_index=true when the rendered video should be the page output; otherwise edit/upload index.html yourself with a <video> pointing at the rendered asset. For non-rendered builds, upload_file → push every staged file needed by the page.
 6. finish_revision(revision=the newly created revision) → publish (MANDATORY!)
 7. set_current_revision(revision=that same newly created revision) → make live
 Stop and give 1-2 sentence summary.
