@@ -148,7 +148,8 @@ CONTENT SAFETY:
   const hyperframesSection = /\b(hyperframes?|video|mp4|rendered\s+clip|animation\s+video|promo\s+video|intro\s+video)\b/i.test(prompt) ? `
 HYPERFRAMES VIDEO SUPPORT:
 - Hyperframes is NOT an AI model. It is deterministic HTML/CSS/media animation code that can either be published directly as an interactive composition OR rendered to a real video file.
-- Hyperframes compositions use plain HTML attributes such as data-composition-id, data-start, data-duration, data-width, data-height, seekable CSS/JS animations, and normal web media tracks.
+- Hyperframes compositions use plain HTML attributes such as data-composition-id, data-start, data-duration (SECONDS, not milliseconds), data-width, data-height, seekable CSS/JS animations, and normal web media tracks.
+- For rendered Hyperframes video, the composition MUST register a timeline: `window.__timelines = window.__timelines || {}; const tl = gsap.timeline({ paused: true }); ...; window.__timelines[compositionId] = tl;`. Pure CSS-only animation is okay for direct HTML mode but is not enough for Hyperframes render.
 - Choose based on the request: if the user wants an actual playable/exported video, write a composition directory (for example hyperframes/index.html), call render_hyperframes_video to create/upload an MP4/WebM, then put a normal <video> element in index.html.
 - If asked to test both Hyperframes integrations, do NOT explain or defer: create one page with (A) a direct/interactive Hyperframes-style composition section and (B) a rendered MP4/WebM produced via render_hyperframes_video and embedded with <video controls>. Finish and promote the test revision.
 - If render_hyperframes_video fails, fix the composition and retry once; if it still fails, publish the direct integration plus a visible error panel explaining the render failure.

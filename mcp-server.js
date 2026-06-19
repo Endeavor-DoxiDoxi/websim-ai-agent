@@ -181,6 +181,29 @@ function assertLocalVideoDuration(path, filePath) {
 }
 
 
+
+function normalizeHyperframesDurations(indexPath) {
+  let html = fs.readFileSync(indexPath, 'utf8');
+  let changed = false;
+  const fixes = [];
+  html = html.replace(/data-duration=(['"])(\d+(?:\.\d+)?)\1/g, (match, quote, raw) => {
+    const value = Number.parseFloat(raw);
+    if (!Number.isFinite(value)) return match;
+    if (value > MAX_VIDEO_SECONDS && value <= MAX_VIDEO_SECONDS * 1000) {
+      const seconds = value / 1000;
+      changed = true;
+      fixes.push(`${raw}s-or-ms->${seconds}s`);
+      return `data-duration=${quote}${Number.isInteger(seconds) ? String(seconds) : String(seconds.toFixed(3)).replace(/0+$/, '').replace(/\.$/, '')}${quote}`;
+    }
+    if (value > MAX_VIDEO_SECONDS) {
+      throw new Error(`render blocked: data-duration=${raw} exceeds max video length (${MAX_VIDEO_SECONDS}s). Hyperframes data-duration is in seconds, not milliseconds.`);
+    }
+    return match;
+  });
+  if (changed) fs.writeFileSync(indexPath, html);
+  return fixes;
+}
+
 function videoEmbedHtml(videoPath, title = 'Rendered video') {
   const safeTitle = String(title || 'Rendered video').replace(/[<&>]/g, ch => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[ch]));
   const safeSrc = encodeProjectPath(videoPath);
@@ -596,7 +619,9 @@ server.tool(
     const compDir = nodePath.resolve(root, composition_dir);
     const rootResolved = nodePath.resolve(root);
     if (!(compDir === rootResolved || compDir.startsWith(rootResolved + nodePath.sep))) throw new Error('render blocked: composition_dir escapes project mirror');
-    if (!fs.existsSync(nodePath.join(compDir, 'index.html'))) throw new Error(`render blocked: ${composition_dir}/index.html does not exist`);
+    const indexPath = nodePath.join(compDir, 'index.html');
+    if (!fs.existsSync(indexPath)) throw new Error(`render blocked: ${composition_dir}/index.html does not exist`);
+    const durationFixes = normalizeHyperframesDurations(indexPath);
     const renderTimeout = Math.min(Math.max(30, timeout_seconds || 180), 240);
     const lint = spawnSync('npx', ['--yes', 'hyperframes@0.6.112', 'lint', '--json', compDir], { cwd: __dirname, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 * 4 });
     if (lint.error) throw new Error(`hyperframes lint failed: ${lint.error.message}`);
@@ -625,7 +650,7 @@ server.tool(
         uploaded.push('index.html');
       }
     }
-    return { content: [{ type: 'text', text: `[${proj.alias}] Rendered Hyperframes composition ${composition_dir} → ${output_path} (${st.size} bytes)${uploaded.length ? `; uploaded ${uploaded.join(', ')} to revision ${revision}` : ''}` }] };
+    return { content: [{ type: 'text', text: `[${proj.alias}] Rendered Hyperframes composition ${composition_dir} → ${output_path} (${st.size} bytes)${durationFixes.length ? `; normalized data-duration ${durationFixes.join(', ')}` : ''}${uploaded.length ? `; uploaded ${uploaded.join(', ')} to revision ${revision}` : ''}` }] };
   }
 );
 
