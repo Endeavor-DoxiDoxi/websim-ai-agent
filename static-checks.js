@@ -41,6 +41,11 @@ assert(mcp.includes('revision ${revision} is still draft'), 'set_current_revisio
 assert(mcp.includes('previous live revision'), 'safe mode response must report previous live revision');
 assert(mcp.includes('download blocked: media size could not be verified'), 'media downloads must fail closed if size cannot be verified');
 
+assert(mcp.includes('DUPLICATE_INDEX_RE'), 'MCP must detect duplicate index filenames');
+assert(mcp.includes('blocked duplicate homepage path'), 'MCP must block index (n).html paths');
+assert(mcp.includes('delete_duplicate_index_files'), 'MCP must expose duplicate index cleanup tool');
+assert(agent.includes('!fixindex') && agent.includes('delete_duplicate_index_files'), 'agent must expose admin duplicate index cleanup');
+
 const media = moderation.extractMediaUrls('x https://example.com/a.mp4 and https://example.com/b.jpg and ![](https://api.websim.com/blobs/abc123)');
 assert.deepStrictEqual(media.map(m => m.type), ['video', 'image', 'unknown']);
 const blockedScheme = moderation.extractMediaUrls('x ftp://example.com/a.mp4');

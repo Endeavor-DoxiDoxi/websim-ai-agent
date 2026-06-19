@@ -300,6 +300,7 @@ Admin commands are restricted to usernames in `WEBSIM_ADMIN_USERNAMES` and are b
 - `!online` / `!back` — resume after maintenance and announce the bot is back online.
 - `!restart` — announce restart; if a prompt is currently building, finish it first, then restart and resume.
 - `!clean` — delete stale local project mirror/cache files.
+- `!fixindex [version]` / `!cleanindex [version]` — delete duplicate homepage assets such as `index (1).html`; keeps the real `index.html` untouched.
 - `!queue` — show a short queue preview.
 - `!drop <n>` — remove one queued item by queue number.
 - `!revisions` / `!versions` — show recent revision numbers.
@@ -329,6 +330,7 @@ This support does not relax media safety. Remote media in generated HTML still g
 - Owner/admin command `!safemode on` (alias `!safe on`) publishes a default page that says: “Something went wrong... Images and Videos are currently disabled for the time being, sorry!” `!safemode off` restores the previously recorded live revision when known; otherwise use `!revisions` and `!revert <version>`.
 - Your `WEBSIM_BEARER` JWT in `.env` is a **live login** for your websim account. Treat it like a password.
 - The agent can create, edit, publish, and delete revisions and comments. Point it only at projects you own.
+- Duplicate homepage paths such as `index (1).html` are blocked. The Websim entrypoint is `index.html`; use `!fixindex` if duplicates already exist on a revision.
 - `AGENT_MAX_TURNS` (default 15) prevents infinite tool-calling loops.
 
 ### Notice

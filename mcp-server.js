@@ -75,6 +75,7 @@ const MAX_VIDEO_SECONDS = Number.parseInt(process.env.WEBSIM_MAX_VIDEO_SECONDS |
 const FETCH_TIMEOUT_MS = Number.parseInt(process.env.WEBSIM_MEDIA_MODERATION_TIMEOUT_MS || '8000', 10);
 const MEDIA_FILE_RE = /\.(png|jpe?g|webp|gif|bmp|avif|mp4|webm|mov|m4v|avi|mkv)(?:$|[?#])/i;
 const VIDEO_FILE_RE = /\.(mp4|webm|mov|m4v|avi|mkv)(?:$|[?#])/i;
+const DUPLICATE_INDEX_RE = /(^|\/)index\s*\(\d+\)\.html$/i;
 
 const SAFE_MODE_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -120,6 +121,15 @@ function contentTypeFor(path) {
 
 function isMediaPath(path) {
   return MEDIA_FILE_RE.test(path);
+}
+
+function assertSafeProjectPath(path) {
+  if (DUPLICATE_INDEX_RE.test(path)) {
+    throw new Error(`blocked duplicate homepage path "${path}". The Websim entrypoint is index.html; edit/upload index.html instead of creating index (n).html files.`);
+  }
+  if (nodePath.isAbsolute(path) || path.split(/[\\/]+/).includes('..')) {
+    throw new Error(`blocked unsafe project path "${path}"`);
+  }
 }
 
 function assertMediaSize(path, bytes, context) {
@@ -194,6 +204,17 @@ async function assetExists(projectId, revision, path, token) {
   if (!res.ok) return false;
   const data = JSON.parse(await res.text());
   return (data.assets || []).some((a) => a.path === path);
+}
+
+async function listAssets(projectId, revision, token) {
+  const res = await fetch(
+    `${API_BASE}/projects/${projectId}/revisions/${revision}/assets`,
+    { headers: authHeaders(token) }
+  );
+  const text = await res.text();
+  if (!res.ok) throw new Error(`list_assets failed (${res.status}): ${text}`);
+  const data = JSON.parse(text);
+  return data.assets || [];
 }
 
 async function getRevisionMeta(proj, revision, token) {
@@ -288,6 +309,7 @@ server.tool(
     project: projectParam,
   },
   async ({ path, content, project: projectAlias }) => {
+    assertSafeProjectPath(path);
     const proj = getProject(projectAlias);
     assertMediaSize(path, Buffer.byteLength(content, 'utf8'), 'write_file');
     const dest = nodePath.join(PROJECT_DIR, proj.alias, path);
@@ -307,6 +329,7 @@ server.tool(
     project: projectParam,
   },
   async ({ path, oldText, newText, project: projectAlias }) => {
+    assertSafeProjectPath(path);
     const proj = getProject(projectAlias);
     const dest = nodePath.join(PROJECT_DIR, proj.alias, path);
     let content;
@@ -377,6 +400,7 @@ server.tool(
     project: projectParam,
   },
   async ({ revision, path, project: projectAlias }) => {
+    assertSafeProjectPath(path);
     const proj = getProject(projectAlias);
     const url = `https://${proj.id}.c.websim.com/${path}?v=${revision}&raw=`;
     if (isMediaPath(path)) {
@@ -420,6 +444,7 @@ server.tool(
     project: projectParam,
   },
   async ({ revision, path, skip_moderation, project: projectAlias }) => {
+    assertSafeProjectPath(path);
     const proj = getProject(projectAlias);
     const token = getBearer(proj);
     const src = nodePath.join(PROJECT_DIR, proj.alias, path);
@@ -486,6 +511,7 @@ server.tool(
     project: projectParam,
   },
   async ({ revision, path, project: projectAlias }) => {
+    assertSafeProjectPath(path);
     const proj = getProject(projectAlias);
     const token = getBearer(proj);
     const res = await fetch(
@@ -495,6 +521,34 @@ server.tool(
     const text = await res.text();
     if (!res.ok) throw new Error(`delete_file failed (${res.status}): ${text}`);
     return { content: [{ type: 'text', text: `[${proj.alias}] Deleted ${path}` }] };
+  }
+);
+
+server.tool(
+  'delete_duplicate_index_files',
+  'Delete duplicate homepage assets like index (1).html from a revision. Keeps the real index.html untouched.',
+  {
+    revision: z.number().int().optional().describe('Revision to clean. Defaults to current live revision.'),
+    project: projectParam,
+  },
+  async ({ revision, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const token = getBearer(proj);
+    const targetRevision = Number.isInteger(revision) ? revision : await getCurrentVersion(proj, token);
+    if (!Number.isInteger(targetRevision)) throw new Error('delete_duplicate_index_files failed: could not determine target revision');
+    const assets = await listAssets(proj.id, targetRevision, token);
+    const dupes = assets.map(a => a.path).filter(p => DUPLICATE_INDEX_RE.test(p));
+    const deleted = [];
+    for (const path of dupes) {
+      const res = await fetch(
+        `${API_BASE}/projects/${proj.id}/revisions/${targetRevision}/assets/${encodeURIComponent(path)}`,
+        { method: 'DELETE', headers: authHeaders(token) }
+      );
+      const text = await res.text();
+      if (!res.ok) throw new Error(`delete duplicate index failed for ${path} (${res.status}): ${text}`);
+      deleted.push(path);
+    }
+    return { content: [{ type: 'text', text: `[${proj.alias}] Duplicate index cleanup on revision ${targetRevision}: deleted ${deleted.length}${deleted.length ? ` (${deleted.join(', ')})` : ''}` }] };
   }
 );
 

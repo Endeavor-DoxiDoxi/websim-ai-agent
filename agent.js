@@ -573,6 +573,19 @@ async function handleAdminCommand(content, comment, state) {
     } catch (err) {
       bgReply(proj, comment.id, `❌ **Cache clean failed:** ${err.message.slice(0, 180)}`);
     }
+  } else if (cmd === '!fixindex' || cmd === '!cleanindex') {
+    state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
+    saveBotState(state);
+    const version = rest[0] ? Number.parseInt(rest[0], 10) : null;
+    const args = { project: proj };
+    if (Number.isInteger(version)) args.revision = version;
+    try {
+      const res = await mcpClient.callTool({ name: 'delete_duplicate_index_files', arguments: args });
+      const text = res.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+      bgReply(proj, comment.id, `🧹 **Duplicate index cleanup complete.**\n${text}`);
+    } catch (err) {
+      bgReply(proj, comment.id, `❌ **Duplicate index cleanup failed:** ${err.message.slice(0, 180)}`);
+    }
   } else if (cmd === '!queue') {
     const preview = state.queue.slice(0, 10).map((item, i) => `${i + 1}. @${item.author}: ${item.content.slice(0, 60)}`).join('\n') || 'Queue is empty.';
     state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
@@ -694,7 +707,7 @@ async function handleAdminCommand(content, comment, state) {
   } else if (cmd === '!help' || cmd === '!adminhelp') {
     state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
     saveBotState(state);
-    bgReply(proj, comment.id, `🛠️ **Admin commands**\n!clearqueue — clear waiting queue\n!pause / !resume — stop/start new build intake\n!maintenance <msg> / !online — public maintenance notices\n!restart — finish current item, restart, then come back\n!clean — clean local project cache\n!queue — preview queue\n!drop <n> — remove queue item\n!revisions — show recent versions\n!safemode on/off — publish safe-mode page or restore previous live revision\n!revert <version> — set live site to previous revision\n!ap <prompt> — admin override build, prompt not echoed`);
+    bgReply(proj, comment.id, `🛠️ **Admin commands**\n!clearqueue — clear waiting queue\n!pause / !resume — stop/start new build intake\n!maintenance <msg> / !online — public maintenance notices\n!restart — finish current item, restart, then come back\n!clean — clean local project cache\n!fixindex [version] — delete duplicate index (n).html assets\n!queue — preview queue\n!drop <n> — remove queue item\n!revisions — show recent versions\n!safemode on/off — publish safe-mode page or restore previous live revision\n!revert <version> — set live site to previous revision\n!ap <prompt> — admin override build, prompt not echoed`);
   } else {
     console.log(`   ⚠️ Unknown admin command: ${cmd}`);
     state.entries[comment.id] = { id: comment.id, category: 'admin', subcategory: 'unknown_command', at: new Date().toISOString(), author: comment.author?.username || 'admin' };
@@ -833,7 +846,7 @@ async function daemonLoop(projectAlias) {
 
   const intSec = Math.round(CONFIG.watchIntervalMs / 1000);
   console.log(`\n🤖 Daemon v2.2 | Model: ${CONFIG.model} | Poll: ${intSec}s | Priority: @Endoxidev`);
-  console.log(`   Queue: ${state.queue.length} | Built: ${state.checklist.length} | Admin: !clearqueue, !pause, !resume, !maintenance, !online, !restart, !clean, !queue, !drop, !revisions, !safemode on/off, !revert, !ap\n`);
+  console.log(`   Queue: ${state.queue.length} | Built: ${state.checklist.length} | Admin: !clearqueue, !pause, !resume, !maintenance, !online, !restart, !clean, !fixindex, !queue, !drop, !revisions, !safemode on/off, !revert, !ap\n`);
   if (recovered > 0) console.log(`   ♻️ Recovered ${recovered} interrupted item(s) back into the queue.`);
 
   await pollAndEnqueue(projectAlias, state);
