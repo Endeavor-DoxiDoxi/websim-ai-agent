@@ -20,7 +20,7 @@ const fs = require('fs');
 const os = require('os');
 const nodePath = require('path');
 const { spawnSync } = require('child_process');
-const { moderateTextForMedia, DEFAULT_MAX_MEDIA_BYTES } = require('./moderation.js');
+const { moderateTextForMedia, DEFAULT_MAX_MEDIA_BYTES, DEFAULT_MAX_VIDEO_SECONDS } = require('./moderation.js');
 
 // ── Config loading ────────────────────────────────────────────────
 require('dotenv').config();
@@ -71,7 +71,8 @@ const API_BASE = 'https://websim.com/api/v1';
 const PROJECT_DIR = nodePath.join(__dirname, 'project');
 const MAX_MEDIA_BYTES = Number.parseInt(process.env.WEBSIM_MAX_MEDIA_BYTES || String(DEFAULT_MAX_MEDIA_BYTES), 10);
 const PROJECT_CACHE_MAX_AGE_MS = Number.parseInt(process.env.WEBSIM_PROJECT_CACHE_MAX_AGE_HOURS || '24', 10) * 60 * 60 * 1000;
-const MAX_VIDEO_SECONDS = Number.parseInt(process.env.WEBSIM_MAX_VIDEO_SECONDS || String(60), 10);
+const MAX_VIDEO_SECONDS = Number.parseInt(process.env.WEBSIM_MAX_VIDEO_SECONDS || String(DEFAULT_MAX_VIDEO_SECONDS), 10);
+const FETCH_TIMEOUT_MS = Number.parseInt(process.env.WEBSIM_MEDIA_MODERATION_TIMEOUT_MS || '8000', 10);
 const MEDIA_FILE_RE = /\.(png|jpe?g|webp|gif|bmp|avif|mp4|webm|mov|m4v|avi|mkv)(?:$|[?#])/i;
 const VIDEO_FILE_RE = /\.(mp4|webm|mov|m4v|avi|mkv)(?:$|[?#])/i;
 
@@ -379,13 +380,15 @@ server.tool(
     const proj = getProject(projectAlias);
     const url = `https://${proj.id}.c.websim.com/${path}?v=${revision}&raw=`;
     if (isMediaPath(path)) {
-      const head = await fetch(url, { method: 'HEAD', headers: { accept: '*/*', referer: `https://websim.com/p/${proj.id}/${revision}` } });
-      if (head.ok) {
-        const headLen = head.headers.get('content-length');
-        if (headLen) assertMediaSize(path, Number.parseInt(headLen, 10), 'download');
-      }
+      const head = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), headers: { accept: '*/*', referer: `https://websim.com/p/${proj.id}/${revision}` } });
+      if (!head.ok) throw new Error(`download blocked: could not preflight media ${path} (${head.status})`);
+      const headLen = head.headers.get('content-length');
+      const bytes = headLen ? Number.parseInt(headLen, 10) : null;
+      if (!Number.isFinite(bytes)) throw new Error(`download blocked: media size could not be verified for ${path}`);
+      assertMediaSize(path, bytes, 'download');
     }
     const res = await fetch(url, {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       headers: {
         accept: '*/*',
         referer: `https://websim.com/p/${proj.id}/${revision}`,

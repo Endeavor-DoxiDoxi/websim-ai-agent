@@ -174,7 +174,7 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions, branc
 
   const MUTATING = new Set(['upload_file', 'finish_revision', 'set_current_revision', 'delete_file', 'create_revision', 'replace_in_file']);
   let edited = false, published = false, publishRetries = 0, writtenFiles = [];
-  let buildRevision = null, finishedRevision = null, currentRevision = null;
+  let buildRevision = null, finishedRevision = null, currentRevision = null, liveRevision = null;
 
   for (let turn = 0; turn < CONFIG.maxTurns; turn++) {
     const response = await callModel(messages, tools);
@@ -207,10 +207,15 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions, branc
 
       if (name === 'write_file' && args.path) { writtenFiles.push(args.path); edited = true; }
 
+      if (name === 'list_revisions') {
+        // Parsed after the tool returns below; no-op here. Kept visible for publish-flow auditing.
+      }
+
       // Auto-upload: if downloading a file we already wrote, upload instead
       if (name === 'download_file' && args.path && writtenFiles.includes(args.path)) {
         console.log(`   ⚡ Auto-uploading ${args.path}...`);
         try {
+          if (!Number.isInteger(buildRevision)) throw new Error(`refusing to upload ${args.path} before create_revision; this build does not own a new revision yet`);
           if (buildRevision && args.revision !== buildRevision) throw new Error(`refusing to upload ${args.path} to revision ${args.revision}; this build owns revision ${buildRevision}`);
           const uploadRes = await mcpClient.callTool({ name: 'upload_file', arguments: { project: projectAlias, path: args.path, revision: args.revision, skip_moderation: adminOverride } });
           const uploadText = uploadRes.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
@@ -222,7 +227,23 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions, branc
         continue;
       }
 
-      if (buildRevision && ['upload_file', 'finish_revision', 'set_current_revision', 'delete_file', 'replace_in_file'].includes(name) && Number.isInteger(args.revision) && args.revision !== buildRevision) {
+      if (['upload_file', 'finish_revision', 'set_current_revision', 'delete_file'].includes(name) && !Number.isInteger(buildRevision)) {
+        const result = `Error: refusing to ${name} before create_revision; every build must own a newly-created revision before publishing or mutating remote state.`;
+        console.error(`   🛑 ${result}`);
+        messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+        messages.push({ role: 'user', content: 'Call list_revisions, then create_revision(parent_version=the current live non-draft revision), then retry on the newly-created revision only.' });
+        continue;
+      }
+
+      if (name === 'create_revision' && Number.isInteger(liveRevision) && args.parent_version !== liveRevision) {
+        const result = `Error: refusing to branch from revision ${args.parent_version}; current live revision is ${liveRevision}.`;
+        console.error(`   🛑 ${result}`);
+        messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+        messages.push({ role: 'user', content: `Create the build revision from parent_version=${liveRevision}. Do not branch from older/currently reverted guesses.` });
+        continue;
+      }
+
+      if (buildRevision && ['upload_file', 'finish_revision', 'set_current_revision', 'delete_file', 'replace_in_file'].includes(name) && (!Number.isInteger(args.revision) || args.revision !== buildRevision)) {
         const result = `Error: refusing to ${name} revision ${args.revision}; this build owns newly-created revision ${buildRevision}. Use revision ${buildRevision}.`;
         console.error(`   🛑 ${result}`);
         messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
@@ -236,6 +257,14 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions, branc
       try {
         const res = await mcpClient.callTool({ name, arguments: args });
         result = res.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+        if (name === 'list_revisions') {
+          try {
+            const jsonStart = result.indexOf('\n[');
+            const revs = JSON.parse(jsonStart >= 0 ? result.slice(jsonStart + 1) : result);
+            const current = revs.find(r => r.current && !r.draft);
+            if (Number.isInteger(current?.version)) liveRevision = current.version;
+          } catch {}
+        }
         if (name === 'create_revision') {
           const m = result.match(/version=(\d+)/);
           if (m) buildRevision = Number.parseInt(m[1], 10);
@@ -339,12 +368,11 @@ async function performSelfRestart(projectAlias, state, reason = 'restart request
 }
 
 function recoverInterruptedProcessing(state, interruptedId) {
-  if (!interruptedId) return 0;
   const queued = new Set((state.queue || []).map(item => item.commentId));
   let recovered = 0;
   for (const entry of Object.values(state.entries || {})) {
     if (!entry || entry.category !== 'processing') continue;
-    if (entry.id !== interruptedId) continue;
+    if (interruptedId && entry.id !== interruptedId) continue;
     if (entry.builtAt || entry.buildError || queued.has(entry.id)) continue;
     const content = entry.content || entry.snippet;
     if (!content) continue;
@@ -555,6 +583,8 @@ async function handleAdminCommand(content, comment, state) {
     const target = rest[0];
     let index = Number.parseInt(target, 10);
     if (!Number.isInteger(index) || index < 1 || index > state.queue.length) {
+      state.entries[comment.id] = { id: comment.id, category: 'admin', subcategory: 'drop_usage', at: new Date().toISOString(), author: comment.author?.username || 'admin' };
+      saveBotState(state);
       bgReply(proj, comment.id, 'Usage: `!drop <queue-number>`');
       return;
     }
@@ -667,6 +697,9 @@ async function handleAdminCommand(content, comment, state) {
     bgReply(proj, comment.id, `🛠️ **Admin commands**\n!clearqueue — clear waiting queue\n!pause / !resume — stop/start new build intake\n!maintenance <msg> / !online — public maintenance notices\n!restart — finish current item, restart, then come back\n!clean — clean local project cache\n!queue — preview queue\n!drop <n> — remove queue item\n!revisions — show recent versions\n!safemode on/off — publish safe-mode page or restore previous live revision\n!revert <version> — set live site to previous revision\n!ap <prompt> — admin override build, prompt not echoed`);
   } else {
     console.log(`   ⚠️ Unknown admin command: ${cmd}`);
+    state.entries[comment.id] = { id: comment.id, category: 'admin', subcategory: 'unknown_command', at: new Date().toISOString(), author: comment.author?.username || 'admin' };
+    saveBotState(state);
+    bgReply(proj, comment.id, 'Unknown admin command. Try `!adminhelp`.');
   }
 }
 

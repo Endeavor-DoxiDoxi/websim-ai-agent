@@ -83,10 +83,11 @@ WEBSIM_MEDIA_MODERATION=true
 WEBSIM_MEDIA_MODERATION_ENDPOINT=https://imgcheck.val.run
 WEBSIM_MEDIA_MODERATION_THRESHOLD=0.55
 WEBSIM_VIDEO_MODERATION_FRAMES=3
-WEBSIM_MAX_MEDIA_BYTES=26214400
+WEBSIM_MAX_MEDIA_BYTES=524288000
 WEBSIM_MAX_IMAGE_BYTES=10485760
-WEBSIM_MAX_VIDEO_BYTES=26214400
-WEBSIM_MAX_VIDEO_SECONDS=60
+WEBSIM_MAX_VIDEO_BYTES=524288000
+WEBSIM_MAX_VIDEO_PROBE_BYTES=52428800
+WEBSIM_MAX_VIDEO_SECONDS=1800
 WEBSIM_MAX_MEDIA_URLS=8
 WEBSIM_MEDIA_MODERATION_TIMEOUT_MS=8000
 WEBSIM_MODERATION_CACHE_TTL_SECONDS=21600
@@ -221,6 +222,14 @@ The agent follows this workflow automatically:
 8. `set_current_revision` → make new version live
 
 It can also do simpler tasks like reading files, listing revisions, posting/replying to comments, etc.
+
+## Hyperframes video requests
+
+The daemon recognizes video/Hyperframes-style requests. When it builds one, it posts a public note that it is “generating hyperframes video” and clarifies that Hyperframes is not an AI model — it is deterministic HTML/code-based video generation. The build prompt teaches the agent to use plain HTML compositions with `data-composition-id`, `data-start`, `data-duration`, dimensions, tracks, and seekable CSS/JS animations while preserving the same media safety checks.
+
+## Media safety guardrails
+
+Remote media moderation is fail-closed. URLs must be `http`/`https`, pass HEAD preflight with verified `content-length` and media `content-type`, stay below the 500MB/30-minute hard cap, and videos must also fit the smaller local probe budget (default 50MB) before any ffmpeg/ffprobe work runs. Unknown-size, unsupported, private/local, redirect-suspicious, or over-budget media is blocked instead of downloaded.
 
 ## Available Tools
 

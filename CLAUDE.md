@@ -83,6 +83,26 @@ The agent follows this workflow for making changes:
 6. `finish_revision` → publish (makes it immutable)
 7. `set_current_revision` → make new version live
 
+Safeguard: a successful build must finish and promote the exact revision it
+created for that build. Do not finish or set current to an older, reverted, or
+pre-existing live revision.
+
+## Hyperframes video support
+
+Hyperframes is supported for video-style site/composition requests. It is **not
+an AI model**; it is an open-source, deterministic HTML/code-based video
+generation workflow. Author Hyperframes content as plain HTML/CSS/JS with
+composition/timing attributes such as:
+
+- `data-composition-id` on the stage/root composition
+- `data-start`, `data-duration`, `data-width`, `data-height`
+- timed `<video>`/`<audio>`/overlay elements with `data-track-index`
+- seekable CSS/JS animations (GSAP/WAAPI/etc.) that can be driven frame by frame
+
+Prefer self-contained, teen-safe code and CSS/JS-generated visuals. Only add
+remote media when necessary, and keep media URLs within the moderation and size
+guardrails.
+
 ## Daemon / Bot Mode
 
 The daemon polls comments every N seconds, triages them via the LLM, and builds
@@ -115,3 +135,7 @@ OpenAI requests to Anthropic format and forwards tools properly:
 - `AGENT_MAX_TURNS` (default 15) prevents infinite tool-calling loops
 - The daemon skips its own comments via `WEBSIM_BOT_USERNAME`
 - Never commit `.env` — it's in `.gitignore`
+- Media moderation is fail-closed. Remote media must be `http`/`https`, pass
+  HEAD preflight with verified `content-length`/`content-type`, stay under the
+  configured hard cap (default 500MB / 30 minutes), and videos must also stay
+  under the smaller local probe/download budget before ffmpeg/ffprobe runs.

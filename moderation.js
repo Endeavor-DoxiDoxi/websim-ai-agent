@@ -6,17 +6,19 @@ const nodePath = require('path');
 const { spawnSync } = require('child_process');
 
 const DEFAULT_ENDPOINT = 'https://imgcheck.val.run';
-const DEFAULT_MAX_MEDIA_BYTES = 25 * 1024 * 1024;
+const DEFAULT_MAX_MEDIA_BYTES = 500 * 1024 * 1024;
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const DEFAULT_MAX_VIDEO_BYTES = 25 * 1024 * 1024;
-const DEFAULT_MAX_VIDEO_SECONDS = 60;
+const DEFAULT_MAX_VIDEO_BYTES = 500 * 1024 * 1024;
+const DEFAULT_MAX_VIDEO_SECONDS = 30 * 60;
+const DEFAULT_MAX_VIDEO_PROBE_BYTES = 50 * 1024 * 1024;
 const DEFAULT_MAX_MEDIA_URLS = 8;
 const DEFAULT_MODERATION_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const BLOCKED_CLASSES = new Set(['Sexy', 'Porn', 'Hentai']);
 const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|avif)(?:[?#][^\s"'<>)]*)?$/i;
 const VIDEO_EXT_RE = /\.(mp4|webm|mov|m4v|avi|mkv)(?:[?#][^\s"'<>)]*)?$/i;
-const URL_RE = /https?:\/\/[^\s"'<>)]*/gi;
+const URL_RE = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)]*/gi;
 const MARKDOWN_IMAGE_RE = /!\[[^\]]*\]\((https?:\/\/[^\s"'<>)]*)\)/gi;
+const MAX_REDIRECTS = 5;
 
 const BLOCK_MESSAGE = 'Blocked for user safety (Please note: this detection is not 100 percent accurate. This affects prompts with images and videos. In the future, a new filtering system might be added, but for now, please understand not all images and videos will be allowed through.)';
 const moderationCache = new Map();
@@ -37,11 +39,18 @@ function moderationConfig(env = process.env) {
     maxMediaBytes,
     maxImageBytes: Math.min(parsePositiveInt(env.WEBSIM_MAX_IMAGE_BYTES, DEFAULT_MAX_IMAGE_BYTES), maxMediaBytes),
     maxVideoBytes: Math.min(parsePositiveInt(env.WEBSIM_MAX_VIDEO_BYTES, DEFAULT_MAX_VIDEO_BYTES), maxMediaBytes),
+    maxVideoProbeBytes: Math.min(parsePositiveInt(env.WEBSIM_MAX_VIDEO_PROBE_BYTES, DEFAULT_MAX_VIDEO_PROBE_BYTES), maxMediaBytes),
     maxVideoSeconds: parsePositiveInt(env.WEBSIM_MAX_VIDEO_SECONDS, DEFAULT_MAX_VIDEO_SECONDS),
     maxMediaUrls: parsePositiveInt(env.WEBSIM_MAX_MEDIA_URLS, DEFAULT_MAX_MEDIA_URLS),
     cacheTtlMs: parsePositiveInt(env.WEBSIM_MODERATION_CACHE_TTL_SECONDS, DEFAULT_MODERATION_CACHE_TTL_MS / 1000) * 1000,
     allowPrivateHosts: env.WEBSIM_ALLOW_PRIVATE_MEDIA_HOSTS === 'true',
   };
+}
+
+function pruneCache(maxEntries = 512) {
+  if (moderationCache.size <= maxEntries) return;
+  const entries = [...moderationCache.entries()].sort((a, b) => (a[1].at || 0) - (b[1].at || 0));
+  for (const [key] of entries.slice(0, Math.max(1, entries.length - maxEntries))) moderationCache.delete(key);
 }
 
 function unique(values) {
@@ -78,7 +87,7 @@ function getCached(type, url, cfg) {
   if (Date.now() - hit.at > cfg.cacheTtlMs) { moderationCache.delete(cacheKey(type, url)); return null; }
   return hit.result;
 }
-function setCached(type, url, result) { moderationCache.set(cacheKey(type, url), { at: Date.now(), result }); }
+function setCached(type, url, result) { moderationCache.set(cacheKey(type, url), { at: Date.now(), result }); pruneCache(); }
 
 function isUnsafeClassification(classes, threshold) {
   const hit = (classes || []).find((c) => BLOCKED_CLASSES.has(c.className) && Number(c.probability) >= threshold);
@@ -98,10 +107,24 @@ async function validateRemoteUrl(rawUrl, cfg) {
   let parsed;
   try { parsed = new URL(rawUrl); } catch { throw new Error('invalid URL'); }
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error(`unsupported protocol ${parsed.protocol}`);
+  if (!parsed.hostname) throw new Error('missing URL host');
   if (!cfg.allowPrivateHosts) {
     const records = await dns.lookup(parsed.hostname, { all: true, verbatim: true });
     if (records.some((r) => isPrivateIp(r.address))) throw new Error('private/local media hosts are blocked');
   }
+}
+
+async function safeFetch(url, init, cfg) {
+  let current = url;
+  for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
+    await validateRemoteUrl(current, cfg);
+    const res = await fetch(current, { ...init, redirect: 'manual', signal: AbortSignal.timeout(cfg.timeoutMs) });
+    if (![301, 302, 303, 307, 308].includes(res.status)) return res;
+    const loc = res.headers.get('location');
+    if (!loc) throw new Error('redirect missing location');
+    current = new URL(loc, current).toString();
+  }
+  throw new Error('too many redirects');
 }
 
 function mediaTypeMatches(type, contentType) {
@@ -112,8 +135,7 @@ function mediaTypeMatches(type, contentType) {
 }
 
 async function preflightRemoteMedia(url, type, cfg) {
-  await validateRemoteUrl(url, cfg);
-  const res = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(cfg.timeoutMs), redirect: 'follow' });
+  const res = await safeFetch(url, { method: 'HEAD' }, cfg);
   if (!res.ok) throw new Error(`HEAD failed (${res.status})`);
   const lenHeader = res.headers.get('content-length');
   const bytes = lenHeader ? Number.parseInt(lenHeader, 10) : null;
@@ -122,13 +144,13 @@ async function preflightRemoteMedia(url, type, cfg) {
   if (!Number.isFinite(bytes)) throw new Error(`${type} size could not be verified`);
   const max = type === 'video' ? cfg.maxVideoBytes : cfg.maxImageBytes;
   if (bytes > max) throw new Error(`${type} is too large (${bytes} bytes > ${max} bytes)`);
+  if (type === 'video' && bytes > cfg.maxVideoProbeBytes) throw new Error(`video is too large to safely probe on this host (${bytes} bytes > ${cfg.maxVideoProbeBytes} bytes)`);
   return { bytes, contentType };
 }
 
 
 async function preflightUnknownMedia(url, cfg) {
-  await validateRemoteUrl(url, cfg);
-  const res = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(cfg.timeoutMs), redirect: 'follow' });
+  const res = await safeFetch(url, { method: 'HEAD' }, cfg);
   if (!res.ok) throw new Error(`HEAD failed (${res.status})`);
   const contentType = (res.headers.get('content-type') || '').toLowerCase();
   if (contentType.startsWith('image/')) {
@@ -143,6 +165,7 @@ async function preflightUnknownMedia(url, cfg) {
     const bytes = len ? Number.parseInt(len, 10) : null;
     if (!Number.isFinite(bytes)) throw new Error('video size could not be verified');
     if (bytes > cfg.maxVideoBytes) throw new Error(`video is too large (${bytes} bytes > ${cfg.maxVideoBytes} bytes)`);
+    if (bytes > cfg.maxVideoProbeBytes) throw new Error(`video is too large to safely probe on this host (${bytes} bytes > ${cfg.maxVideoProbeBytes} bytes)`);
     return 'video';
   }
   throw new Error(`unknown media URL has non-media content-type ${contentType || 'missing'}`);
@@ -174,18 +197,22 @@ async function downloadLimited(url, cfg, expectedBytes) {
   const dir = await fs.promises.mkdtemp(nodePath.join(os.tmpdir(), 'websim-media-'));
   const file = nodePath.join(dir, 'media');
   const cleanup = () => fs.rmSync(dir, { recursive: true, force: true });
-  const res = await fetch(url, { signal: AbortSignal.timeout(cfg.timeoutMs), redirect: 'follow' });
+  const res = await safeFetch(url, { method: 'GET' }, cfg);
   if (!res.ok) { cleanup(); throw new Error(`download failed (${res.status})`); }
   const ct = res.headers.get('content-type') || '';
   if (!mediaTypeMatches('video', ct)) { cleanup(); throw new Error(`unexpected download content-type ${ct || 'missing'}`); }
   let seen = 0;
-  const chunks = [];
-  for await (const chunk of res.body) {
-    seen += chunk.length;
-    if (seen > cfg.maxVideoBytes || (expectedBytes && seen > expectedBytes + 1024)) { cleanup(); throw new Error('video download exceeded verified size limit'); }
-    chunks.push(chunk);
+  const out = fs.createWriteStream(file, { flags: 'wx' });
+  try {
+    for await (const chunk of res.body) {
+      seen += chunk.length;
+      if (seen > cfg.maxVideoProbeBytes || seen > cfg.maxVideoBytes || (expectedBytes && seen > expectedBytes + 1024)) { out.destroy(); cleanup(); throw new Error('video download exceeded verified size limit'); }
+      if (!out.write(chunk)) await new Promise((resolve, reject) => { out.once('drain', resolve); out.once('error', reject); });
+    }
+    await new Promise((resolve, reject) => out.end((err) => err ? reject(err) : resolve()));
+  } catch (err) {
+    out.destroy(); cleanup(); throw err;
   }
-  await fs.promises.writeFile(file, Buffer.concat(chunks));
   return { file, cleanup, bytes: seen };
 }
 
@@ -296,6 +323,7 @@ module.exports = {
   DEFAULT_MAX_IMAGE_BYTES,
   DEFAULT_MAX_VIDEO_BYTES,
   DEFAULT_MAX_VIDEO_SECONDS,
+  DEFAULT_MAX_VIDEO_PROBE_BYTES,
   extractMediaUrls,
   moderateTextForMedia,
   moderationConfig,
