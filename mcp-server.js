@@ -583,10 +583,10 @@ server.tool(
     update_index: z.boolean().optional().describe('If true and revision is provided, writes/uploads index.html with a <video> tag pointing at the rendered asset.'),
     title: z.string().optional().describe('Title used when update_index=true.'),
     quality: z.enum(['draft', 'medium', 'high']).optional().describe('Hyperframes render quality. Default draft for speed.'),
-    timeout_seconds: z.number().int().optional().describe('Render timeout in seconds. Default 600.'),
+    timeout_seconds: z.number().int().optional().describe('Render timeout in seconds. Default 180, capped at 240 to avoid wedging the Pi.'),
     project: projectParam,
   },
-  async ({ composition_dir, output_path = 'assets/hyperframes-render.mp4', revision, update_index = false, title = 'Rendered video', quality = 'draft', timeout_seconds = 600, project: projectAlias }) => {
+  async ({ composition_dir, output_path = 'assets/hyperframes-render.mp4', revision, update_index = false, title = 'Rendered video', quality = 'draft', timeout_seconds = 180, project: projectAlias }) => {
     assertSafeProjectPath(composition_dir);
     assertSafeProjectPath(output_path);
     if (!/\.(mp4|webm)$/i.test(output_path)) throw new Error('render_hyperframes_video output_path must end in .mp4 or .webm');
@@ -597,12 +597,16 @@ server.tool(
     const rootResolved = nodePath.resolve(root);
     if (!(compDir === rootResolved || compDir.startsWith(rootResolved + nodePath.sep))) throw new Error('render blocked: composition_dir escapes project mirror');
     if (!fs.existsSync(nodePath.join(compDir, 'index.html'))) throw new Error(`render blocked: ${composition_dir}/index.html does not exist`);
+    const renderTimeout = Math.min(Math.max(30, timeout_seconds || 180), 240);
+    const lint = spawnSync('npx', ['--yes', 'hyperframes@0.6.112', 'lint', '--json', compDir], { cwd: __dirname, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 * 4 });
+    if (lint.error) throw new Error(`hyperframes lint failed: ${lint.error.message}`);
+    if (lint.status !== 0) throw new Error(`hyperframes lint failed (${lint.status}): ${(lint.stderr || lint.stdout || '').slice(0, 4000)}`);
     const outFile = nodePath.join(root, output_path);
     await fs.promises.mkdir(nodePath.dirname(outFile), { recursive: true });
     const args = ['--yes', 'hyperframes@0.6.112', 'render', compDir, '--quality', quality, '--output', outFile];
-    const proc = spawnSync('npx', args, { cwd: __dirname, encoding: 'utf8', timeout: Math.max(30, timeout_seconds) * 1000, maxBuffer: 1024 * 1024 * 8 });
-    if (proc.error) throw new Error(`hyperframes render failed: ${proc.error.message}`);
-    if (proc.status !== 0) throw new Error(`hyperframes render failed (${proc.status}): ${(proc.stderr || proc.stdout || '').slice(0, 4000)}`);
+    const proc = spawnSync('npx', args, { cwd: __dirname, encoding: 'utf8', timeout: renderTimeout * 1000, maxBuffer: 1024 * 1024 * 8 });
+    if (proc.error) throw new Error(`hyperframes render failed after ${renderTimeout}s: ${proc.error.message}`);
+    if (proc.status !== 0) throw new Error(`hyperframes render failed (${proc.status}): ${(proc.stderr || proc.stdout || 'no renderer output').slice(0, 4000)}`);
     const st = await fs.promises.stat(outFile).catch(() => null);
     if (!st || st.size <= 0) throw new Error('hyperframes render failed: output video was not created');
     assertMediaSize(output_path, st.size, 'render');

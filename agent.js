@@ -177,7 +177,7 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions, branc
   console.log(`\n🤖 Building: "${prompt.slice(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
 
   const MUTATING = new Set(['upload_file', 'render_hyperframes_video', 'finish_revision', 'set_current_revision', 'delete_file', 'create_revision', 'replace_in_file']);
-  let edited = false, published = false, publishRetries = 0, writtenFiles = [];
+  let edited = false, published = false, publishRetries = 0, writtenFiles = [], renderFailures = 0;
   const stagedFiles = new Set();
   const uploadedFiles = new Set();
   let buildRevision = null, finishedRevision = null, currentRevision = null, liveRevision = null;
@@ -210,6 +210,13 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions, branc
       try { args = JSON.parse(tc.function?.arguments || '{}'); } catch {}
       if (!args.project && projectAlias) args.project = projectAlias;
       if (adminOverride && name === 'upload_file') args.skip_moderation = true;
+
+      if (name === 'render_hyperframes_video' && renderFailures >= 2) {
+        const result = 'Error: render_hyperframes_video already failed twice for this build. Do not retry rendering. Publish the direct Hyperframes integration plus a visible error panel saying the rendered-video export failed.';
+        messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+        messages.push({ role: 'user', content: 'Stop retrying rendered export. Finish a safe direct/interactive Hyperframes page with a visible rendered-video failure panel, then publish.' });
+        continue;
+      }
 
       if (name === 'write_file' && args.path) { writtenFiles.push(args.path); stagedFiles.add(args.path); edited = true; }
 
@@ -304,8 +311,10 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions, branc
           const m = result.match(/version=(\d+)/);
           if (m) buildRevision = Number.parseInt(m[1], 10);
         }
+        if (name === 'render_hyperframes_video' && result.startsWith('Error:')) renderFailures += 1;
+        if (name === 'render_hyperframes_video' && !result.startsWith('Error:')) renderFailures = 0;
         if ((name === 'write_file' || name === 'replace_in_file') && args.path && !result.startsWith('Error:')) stagedFiles.add(args.path);
-        if (name === 'upload_file' && args.path && !result.startsWith('Error:')) uploadedFiles.add(args.path);
+        if ((name === 'upload_file' || name === 'render_hyperframes_video') && args.path && !result.startsWith('Error:')) uploadedFiles.add(args.path);
         if (name === 'finish_revision' && args.revision === buildRevision) finishedRevision = args.revision;
         if (name === 'set_current_revision' && args.revision === buildRevision && finishedRevision === buildRevision) { currentRevision = args.revision; published = true; }
         console.log(`   ↳ ${result.slice(0, 200)}`);

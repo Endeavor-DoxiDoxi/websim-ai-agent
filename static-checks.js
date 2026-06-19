@@ -93,3 +93,8 @@ assert(agent.includes('render_hyperframes_video'), 'agent prompt/tool flow must 
 
 assert(agent.includes('If asked to test both Hyperframes integrations'), 'agent must have explicit both-integrations test instruction');
 assert(agent.includes('render_hyperframes_video fails'), 'agent must have render failure fallback behavior');
+
+
+assert(mcp.includes('hyperframes@0.6.112', 'lint'), 'render tool must lint Hyperframes before rendering');
+assert(mcp.includes('capped at 240'), 'render tool must cap render timeout');
+assert(agent.includes('renderFailures >= 2'), 'agent must stop retrying stuck Hyperframes renders');
