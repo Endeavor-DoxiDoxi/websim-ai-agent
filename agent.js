@@ -26,6 +26,9 @@ const CONFIG = {
 
 const ADMIN_USERNAMES = new Set((process.env.WEBSIM_ADMIN_USERNAMES || 'Endoxidev').split(',').map(s => s.trim()).filter(Boolean));
 
+const HYPERFRAMES_NOTICE = '🎬 generating hyperframes video — Hyperframes is not an AI model; it is pure HTML video code / code-based video generation.';
+const VIDEO_REQUEST_RE = /\b(hyperframes?|video|mp4|rendered\s+clip|animation\s+video|promo\s+video|intro\s+video)\b/i;
+
 const RANDOM_QUOTES = [
   "Good things come to those who wait! 🌟",
   "Cooking up something special... 🍳",
@@ -142,9 +145,16 @@ CONTENT SAFETY:
 - If a request asks for unsafe or age-inappropriate content, refuse by making no project edits and explain briefly.
 - Do not add image/video URLs unless they are clearly necessary and safe; media URLs are scanned before upload and unsafe media will be blocked.
 `;
+  const hyperframesSection = /\b(hyperframes?|video|mp4|rendered\s+clip|animation\s+video|promo\s+video|intro\s+video)\b/i.test(prompt) ? `
+HYPERFRAMES VIDEO SUPPORT:
+- For video-style site requests, use Hyperframes-style plain HTML compositions: data-composition-id, data-start, data-duration, data-width, data-height, seekable CSS/JS animations, and normal web media tracks.
+- Hyperframes is NOT an AI model. It is pure HTML video code / deterministic code-based video generation built from HTML/CSS/media/animations.
+- Keep generated video code teen-safe and avoid adding remote media unless clearly necessary and safe.
+` : '';
+
   const messages = [
     { role: 'system', content: `You edit a websim.com project. Use TOOLS — never describe changes in prose.
-${safetySection}
+${safetySection}${hyperframesSection}
 
 WORKFLOW:
 1. list_revisions → find the current/live non-draft revision marked current: true
@@ -152,11 +162,11 @@ WORKFLOW:
 3. download_file → read contents
 4. For small edits, prefer replace_in_file → stage exact local patches. Use write_file only when replacing/creating a whole file.
 5. upload_file → push
-6. finish_revision → publish (MANDATORY!)
-7. set_current_revision → make live
+6. finish_revision(revision=the newly created revision) → publish (MANDATORY!)
+7. set_current_revision(revision=that same newly created revision) → make live
 Stop and give 1-2 sentence summary.
 
-Project: "${projectAlias || 'default'}". Always start with list_revisions and branch from the revision marked current.${guideSection}` },
+Project: "${projectAlias || 'default'}". Always start with list_revisions, branch from the revision marked current, and only finish/promote the exact revision created for this build.${guideSection}` },
     { role: 'user', content: prompt },
   ];
 
@@ -164,6 +174,7 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions and br
 
   const MUTATING = new Set(['upload_file', 'finish_revision', 'set_current_revision', 'delete_file', 'create_revision', 'replace_in_file']);
   let edited = false, published = false, publishRetries = 0, writtenFiles = [];
+  let buildRevision = null, finishedRevision = null, currentRevision = null;
 
   for (let turn = 0; turn < CONFIG.maxTurns; turn++) {
     const response = await callModel(messages, tools);
@@ -175,7 +186,7 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions and br
       if (edited && !published && publishRetries < 3) {
         publishRetries++;
         console.log(`   ⚠️ Not published (retry ${publishRetries}/3)`);
-        messages.push({ role: 'user', content: 'Call finish_revision then set_current_revision NOW. Do NOT download anything else.' });
+        messages.push({ role: 'user', content: `Call finish_revision(revision=${buildRevision || 'the newly created revision'}) then set_current_revision(revision=${buildRevision || 'that same revision'}) NOW. Do NOT download anything else. Do NOT promote any older/current/reverted revision.` });
         continue;
       }
       const summary = (msg.content || '').trim();
@@ -200,6 +211,7 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions and br
       if (name === 'download_file' && args.path && writtenFiles.includes(args.path)) {
         console.log(`   ⚡ Auto-uploading ${args.path}...`);
         try {
+          if (buildRevision && args.revision !== buildRevision) throw new Error(`refusing to upload ${args.path} to revision ${args.revision}; this build owns revision ${buildRevision}`);
           const uploadRes = await mcpClient.callTool({ name: 'upload_file', arguments: { project: projectAlias, path: args.path, revision: args.revision, skip_moderation: adminOverride } });
           const uploadText = uploadRes.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
           console.log(`   ↳ ${uploadText.slice(0, 200)}`);
@@ -210,13 +222,26 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions and br
         continue;
       }
 
+      if (buildRevision && ['upload_file', 'finish_revision', 'set_current_revision', 'delete_file', 'replace_in_file'].includes(name) && Number.isInteger(args.revision) && args.revision !== buildRevision) {
+        const result = `Error: refusing to ${name} revision ${args.revision}; this build owns newly-created revision ${buildRevision}. Use revision ${buildRevision}.`;
+        console.error(`   🛑 ${result}`);
+        messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+        messages.push({ role: 'user', content: `Use revision ${buildRevision} for all remaining upload/finish/set_current calls. Do not promote any other revision.` });
+        continue;
+      }
+
       if (MUTATING.has(name)) edited = true;
-      if (name === 'finish_revision') published = true;
       console.log(`   🔧 ${name}(${JSON.stringify(args).slice(0, 100)})`);
       let result;
       try {
         const res = await mcpClient.callTool({ name, arguments: args });
         result = res.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+        if (name === 'create_revision') {
+          const m = result.match(/version=(\d+)/);
+          if (m) buildRevision = Number.parseInt(m[1], 10);
+        }
+        if (name === 'finish_revision' && args.revision === buildRevision) finishedRevision = args.revision;
+        if (name === 'set_current_revision' && args.revision === buildRevision && finishedRevision === buildRevision) { currentRevision = args.revision; published = true; }
         console.log(`   ↳ ${result.slice(0, 200)}`);
       } catch (err) { result = `Error: ${err.message}`; console.error(`   ❌ ${err.message}`); }
       messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
@@ -362,6 +387,17 @@ function canSendPublicStatus(state, author) {
   return true;
 }
 
+
+async function getCurrentRevisionFromMcp(projectAlias) {
+  const res = await mcpClient.callTool({ name: 'list_revisions', arguments: { project: projectAlias } });
+  const text = res.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+  const jsonStart = text.indexOf('\n[');
+  const json = jsonStart >= 0 ? text.slice(jsonStart + 1) : text;
+  const revs = JSON.parse(json);
+  const current = revs.find(r => r.current && !r.draft);
+  return current?.version || null;
+}
+
 async function handlePublicStatus(comment, state) {
   const author = comment.author?.username || 'unknown';
   const proj = state._projectAlias || 'opus48';
@@ -396,6 +432,7 @@ async function addToQueue(state, comment) {
 
   if (content.startsWith('!')) {
     state.entries[comment.id] = { id: comment.id, category: 'unknown_command', at: new Date().toISOString(), author };
+    saveBotState(state);
     bgReply(state._projectAlias || 'opus48', comment.id, 'Unknown command. Try `!status` to see the queue.');
     return;
   }
@@ -511,6 +548,7 @@ async function handleAdminCommand(content, comment, state) {
   } else if (cmd === '!queue') {
     const preview = state.queue.slice(0, 10).map((item, i) => `${i + 1}. @${item.author}: ${item.content.slice(0, 60)}`).join('\n') || 'Queue is empty.';
     state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
+    saveBotState(state);
     bgReply(proj, comment.id, `📋 **Queue preview** (${state.queue.length} total)\n${preview}`);
     console.log(`   📋 Admin queue preview: ${state.queue.length} queued`);
   } else if (cmd === '!drop') {
@@ -527,14 +565,47 @@ async function handleAdminCommand(content, comment, state) {
     bgReply(proj, comment.id, `✅ Dropped queue item #${index}.`);
     console.log(`   🗑️ Admin dropped queue item #${index}`);
   } else if (cmd === '!safemode' || cmd === '!safe') {
-    console.log(`   🛡️ ${cmd}: enabling safe mode page...`);
+    const mode = (rest[0] || 'on').toLowerCase();
     state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
     saveBotState(state);
+    if (!['on', 'off'].includes(mode)) {
+      bgReply(proj, comment.id, 'Usage: `!safemode on` to enable, `!safemode off` to restore the prior live revision. If no prior revision is known, use `!revert <version>`.');
+      return;
+    }
+    if (mode === 'off') {
+      const previous = state.safeModePreviousRevision;
+      if (!Number.isInteger(previous)) {
+        bgReply(proj, comment.id, '⚠️ **No prior live revision recorded for safe mode.** Use `!revert <version>` after checking `!revisions`.');
+        return;
+      }
+      console.log(`   🛡️ ${cmd} off: restoring revision ${previous}...`);
+      try {
+        const res = await mcpClient.callTool({ name: 'set_current_revision', arguments: { project: proj, revision: previous } });
+        const text = res.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+        state.safeModeEnabled = false;
+        state.safeModeRestoredAt = new Date().toISOString();
+        state.safeModePreviousRevision = null;
+        saveBotState(state);
+        bgReply(proj, comment.id, `✅ **Safe mode disabled.** Restored revision ${previous}.`);
+        console.log(`   🛡️ Safe mode disabled: ${text}`);
+      } catch (err) {
+        bgReply(proj, comment.id, `❌ **Safe mode restore failed:** ${err.message.slice(0, 180)}. You can still use \`!revert <version>\`.`);
+        console.error(`   ❌ Safe mode restore failed: ${err.message}`);
+      }
+      return;
+    }
+
+    console.log(`   🛡️ ${cmd} on: enabling safe mode page...`);
     bgReply(proj, comment.id, WIP + '🛡️ Enabling safe mode page now...');
     try {
+      const previous = await getCurrentRevisionFromMcp(proj);
       const res = await mcpClient.callTool({ name: 'enable_safe_mode', arguments: { project: proj } });
       const text = res.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
-      bgReply(proj, comment.id, `✅ **Safe mode enabled.**\n\n${text}`);
+      if (Number.isInteger(previous)) state.safeModePreviousRevision = previous;
+      state.safeModeEnabled = true;
+      state.safeModeEnabledAt = new Date().toISOString();
+      saveBotState(state);
+      bgReply(proj, comment.id, `✅ **Safe mode enabled.** Previous live revision: ${previous || 'unknown'}. Use \`!safemode off\` to restore if known, or \`!revert <version>\`.\n\n${text}`);
       console.log(`   🛡️ Safe mode enabled: ${text}`);
     } catch (err) {
       bgReply(proj, comment.id, `❌ **Safe mode failed:** ${err.message.slice(0, 180)}`);
@@ -593,7 +664,7 @@ async function handleAdminCommand(content, comment, state) {
   } else if (cmd === '!help' || cmd === '!adminhelp') {
     state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
     saveBotState(state);
-    bgReply(proj, comment.id, `🛠️ **Admin commands**\n!clearqueue — clear waiting queue\n!pause / !resume — stop/start new build intake\n!maintenance <msg> / !online — public maintenance notices\n!restart — finish current item, restart, then come back\n!clean — clean local project cache\n!queue — preview queue\n!drop <n> — remove queue item\n!revisions — show recent versions\n!safemode — publish safe-mode page\n!revert <version> — set live site to previous revision\n!ap <prompt> — admin override build, prompt not echoed`);
+    bgReply(proj, comment.id, `🛠️ **Admin commands**\n!clearqueue — clear waiting queue\n!pause / !resume — stop/start new build intake\n!maintenance <msg> / !online — public maintenance notices\n!restart — finish current item, restart, then come back\n!clean — clean local project cache\n!queue — preview queue\n!drop <n> — remove queue item\n!revisions — show recent versions\n!safemode on/off — publish safe-mode page or restore previous live revision\n!revert <version> — set live site to previous revision\n!ap <prompt> — admin override build, prompt not echoed`);
   } else {
     console.log(`   ⚠️ Unknown admin command: ${cmd}`);
   }
@@ -647,6 +718,10 @@ async function processNextInQueue(projectAlias, state) {
   bgReply(projectAlias, item.commentId, WIP + (decision.decisionReply || (decision.actionable ? "Great idea! I'll build this now." : "Thanks for the comment!")));
   console.log('   💬 Decision reply sent.');
 
+  if (decision.actionable && VIDEO_REQUEST_RE.test(`${item.content} ${decision.editPrompt || ''}`)) {
+    bgReply(projectAlias, item.commentId, HYPERFRAMES_NOTICE);
+  }
+
   // Build
   if (decision.actionable && decision.editPrompt) {
     console.log('   🛠️  Building...');
@@ -699,7 +774,7 @@ async function daemonLoop(projectAlias) {
 
   const intSec = Math.round(CONFIG.watchIntervalMs / 1000);
   console.log(`\n🤖 Daemon v2.2 | Model: ${CONFIG.model} | Poll: ${intSec}s | Priority: @Endoxidev`);
-  console.log(`   Queue: ${state.queue.length} | Built: ${state.checklist.length} | Admin: !clearqueue, !pause, !resume, !maintenance, !online, !restart, !clean, !queue, !drop, !revisions, !safemode, !revert, !ap\n`);
+  console.log(`   Queue: ${state.queue.length} | Built: ${state.checklist.length} | Admin: !clearqueue, !pause, !resume, !maintenance, !online, !restart, !clean, !queue, !drop, !revisions, !safemode on/off, !revert, !ap\n`);
   if (recovered > 0) console.log(`   ♻️ Recovered ${recovered} interrupted item(s) back into the queue.`);
 
   await pollAndEnqueue(projectAlias, state);

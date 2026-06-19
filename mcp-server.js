@@ -71,7 +71,7 @@ const API_BASE = 'https://websim.com/api/v1';
 const PROJECT_DIR = nodePath.join(__dirname, 'project');
 const MAX_MEDIA_BYTES = Number.parseInt(process.env.WEBSIM_MAX_MEDIA_BYTES || String(DEFAULT_MAX_MEDIA_BYTES), 10);
 const PROJECT_CACHE_MAX_AGE_MS = Number.parseInt(process.env.WEBSIM_PROJECT_CACHE_MAX_AGE_HOURS || '24', 10) * 60 * 60 * 1000;
-const MAX_VIDEO_SECONDS = Number.parseInt(process.env.WEBSIM_MAX_VIDEO_SECONDS || String(30 * 60), 10);
+const MAX_VIDEO_SECONDS = Number.parseInt(process.env.WEBSIM_MAX_VIDEO_SECONDS || String(60), 10);
 const MEDIA_FILE_RE = /\.(png|jpe?g|webp|gif|bmp|avif|mp4|webm|mov|m4v|avi|mkv)(?:$|[?#])/i;
 const VIDEO_FILE_RE = /\.(mp4|webm|mov|m4v|avi|mkv)(?:$|[?#])/i;
 
@@ -195,17 +195,21 @@ async function assetExists(projectId, revision, path, token) {
   return (data.assets || []).some((a) => a.path === path);
 }
 
-async function getLatestPublishedRevision(proj, token) {
+async function getRevisionMeta(proj, revision, token) {
   const res = await fetch(`${API_BASE}/projects/${proj.id}/revisions`, { headers: authHeaders(token) });
   const text = await res.text();
-  if (!res.ok) throw new Error(`safe_mode list_revisions failed (${res.status}): ${text}`);
+  if (!res.ok) throw new Error(`list_revisions failed (${res.status}): ${text}`);
   const data = JSON.parse(text);
-  const rev = (data.revisions?.data || [])
-    .map((r) => r.project_revision)
-    .filter((r) => r && !r.draft && Number.isInteger(r.version))
-    .sort((a, b) => b.version - a.version)[0];
-  if (!rev) throw new Error('safe_mode failed: no published revision found');
-  return rev.version;
+  const rev = (data.revisions?.data || []).map((r) => r.project_revision).find((r) => r?.version === revision);
+  return rev || null;
+}
+
+async function getCurrentPublishedRevision(proj, token) {
+  const current = await getCurrentVersion(proj, token);
+  if (!Number.isInteger(current)) throw new Error('safe_mode failed: current live revision could not be determined');
+  const rev = await getRevisionMeta(proj, current, token);
+  if (!rev || rev.draft) throw new Error(`safe_mode failed: current revision ${current} is missing or still draft`);
+  return current;
 }
 
 async function createDraftRevision(proj, parentVersion, token) {
@@ -233,6 +237,8 @@ async function finishRevision(proj, revision, token) {
   );
   const text = await res.text();
   if (!res.ok) throw new Error(`finish_revision failed (${res.status}): ${text}`);
+  const meta = await getRevisionMeta(proj, revision, token);
+  if (!meta || meta.draft) throw new Error(`finish_revision verification failed: revision ${revision} is not finalized`);
 }
 
 async function setCurrentRevision(proj, revision, token) {
@@ -246,6 +252,8 @@ async function setCurrentRevision(proj, revision, token) {
   );
   const text = await res.text();
   if (!res.ok) throw new Error(`set_current_revision failed (${res.status}): ${text}`);
+  const current = await getCurrentVersion(proj, token);
+  if (current !== revision) throw new Error(`set_current_revision verification failed: live revision is ${current}, expected ${revision}`);
 }
 
 async function getCurrentVersion(proj, token) {
@@ -457,12 +465,12 @@ server.tool(
   async ({ project: projectAlias }) => {
     const proj = getProject(projectAlias);
     const token = getBearer(proj);
-    const parent = await getLatestPublishedRevision(proj, token);
+    const parent = await getCurrentPublishedRevision(proj, token);
     const revision = await createDraftRevision(proj, parent, token);
     await uploadAsset(proj.id, revision, 'index.html', SAFE_MODE_HTML, token, false);
     await finishRevision(proj, revision, token);
     await setCurrentRevision(proj, revision, token);
-    return { content: [{ type: 'text', text: `[${proj.alias}] Safe mode enabled at revision ${revision}` }] };
+    return { content: [{ type: 'text', text: `[${proj.alias}] Safe mode enabled at revision ${revision} (previous live revision ${parent})` }] };
   }
 );
 
@@ -563,6 +571,8 @@ server.tool(
     );
     const text = await res.text();
     if (!res.ok) throw new Error(`finish_revision failed (${res.status}): ${text}`);
+    const meta = await getRevisionMeta(proj, revision, token);
+    if (!meta || meta.draft) throw new Error(`finish_revision verification failed: revision ${revision} is not finalized`);
     let summary = text;
     try {
       const rev = JSON.parse(text).project_revision;
@@ -582,6 +592,9 @@ server.tool(
   async ({ revision, project: projectAlias }) => {
     const proj = getProject(projectAlias);
     const token = getBearer(proj);
+    const rev = await getRevisionMeta(proj, revision, token);
+    if (!rev) throw new Error(`set_current_revision blocked: revision ${revision} does not exist`);
+    if (rev.draft) throw new Error(`set_current_revision blocked: revision ${revision} is still draft; call finish_revision first`);
     const res = await fetch(
       `${API_BASE}/projects/${proj.id}`,
       {
@@ -592,6 +605,8 @@ server.tool(
     );
     const text = await res.text();
     if (!res.ok) throw new Error(`set_current_revision failed (${res.status}): ${text}`);
+    const current = await getCurrentVersion(proj, token);
+    if (current !== revision) throw new Error(`set_current_revision verification failed: live revision is ${current}, expected ${revision}`);
     let summary = text;
     try {
       const p = JSON.parse(text).project ?? JSON.parse(text);

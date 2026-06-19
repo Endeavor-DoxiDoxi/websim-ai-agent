@@ -82,9 +82,14 @@ WEBSIM_ADMIN_USERNAMES=Endoxidev
 WEBSIM_MEDIA_MODERATION=true
 WEBSIM_MEDIA_MODERATION_ENDPOINT=https://imgcheck.val.run
 WEBSIM_MEDIA_MODERATION_THRESHOLD=0.55
-WEBSIM_VIDEO_MODERATION_FRAMES=5
-WEBSIM_MAX_MEDIA_BYTES=524288000
-WEBSIM_MAX_VIDEO_SECONDS=1800
+WEBSIM_VIDEO_MODERATION_FRAMES=3
+WEBSIM_MAX_MEDIA_BYTES=26214400
+WEBSIM_MAX_IMAGE_BYTES=10485760
+WEBSIM_MAX_VIDEO_BYTES=26214400
+WEBSIM_MAX_VIDEO_SECONDS=60
+WEBSIM_MAX_MEDIA_URLS=8
+WEBSIM_MEDIA_MODERATION_TIMEOUT_MS=8000
+WEBSIM_MODERATION_CACHE_TTL_SECONDS=21600
 WEBSIM_PROJECT_CACHE_MAX_AGE_HOURS=24
 ```
 
@@ -289,10 +294,18 @@ Admin commands are restricted to usernames in `WEBSIM_ADMIN_USERNAMES` and are b
 - `!queue` — show a short queue preview.
 - `!drop <n>` — remove one queued item by queue number.
 - `!revisions` / `!versions` — show recent revision numbers.
-- `!safemode` / `!safe` — publish the default safe-mode page. This is **not a toggle**; running it twice publishes safe mode twice.
+- `!safemode on` / `!safe on` — publish the default safe-mode page and record the previous live revision when possible.
+- `!safemode off` / `!safe off` — restore the recorded previous live revision. If no previous revision is known, use `!revisions` then `!revert <version>`.
 - `!revert <version>` / `!restore <version>` — set the live project back to a previous revision.
 - `!ap <prompt>` / `!adminprompt <prompt>` — trusted admin override build. The bot does not echo the prompt and uses unfiltered upload mode for emergency repair/recovery.
 - `!help` / `!adminhelp` — show admin commands.
+
+
+## Hyperframes support
+
+For requests that ask for video-style output, the agent nudges the builder toward Hyperframes-style compositions: plain HTML/CSS/JS with `data-composition-id`, timing attributes, tracks, and seekable animation code. It also posts a public note while building: “generating hyperframes video” and clarifies that Hyperframes is **not an AI model** — it is pure HTML video code / deterministic code-based video generation.
+
+This support does not relax media safety. Remote media in generated HTML still goes through the moderation/upload guardrails, and large/slow/unverifiable videos fail closed.
 
 ## Safety
 
@@ -301,10 +314,10 @@ Admin commands are restricted to usernames in `WEBSIM_ADMIN_USERNAMES` and are b
 - Image/video URLs in comments are moderated before the AI sees the prompt. Blocked prompts receive a generic safety error.
 - Image/video URLs in uploaded HTML/CSS/JS/JSON/Markdown/text files are moderated before `upload_file` can publish them.
 - Default media moderation endpoint: `https://imgcheck.val.run` using nsfwjs classes. `Neutral` and `Drawing` are allowed; `Sexy`, `Porn`, and `Hentai` are blocked at `WEBSIM_MEDIA_MODERATION_THRESHOLD` or higher.
-- Image/video media is limited to `WEBSIM_MAX_MEDIA_BYTES` bytes (default 500MB) before download/upload where size can be verified.
-- Video URLs are checked with `ffprobe` and blocked if longer than `WEBSIM_MAX_VIDEO_SECONDS` (default 1800 seconds / 30 minutes), then sampled with `ffmpeg`; if more than 50% of sampled frames are unsafe, the upload/request is blocked. If a video cannot be verified, it is blocked by default.
+- Media is capped by strict defaults: `WEBSIM_MAX_MEDIA_BYTES`/`WEBSIM_MAX_VIDEO_BYTES` default to 25MB, `WEBSIM_MAX_IMAGE_BYTES` defaults to 10MB, and `WEBSIM_MAX_VIDEO_SECONDS` defaults to 60 seconds.
+- Remote video URLs fail closed unless they pass protocol, DNS/private-host, `HEAD`, `content-type`, `content-length`, bounded download, local duration, and sampled-frame checks. Slow streams, missing sizes, oversized media, unsupported protocols, and unverifiable videos are blocked before they can hammer the Pi.
 - Local project mirror files under `project/` are cache only and are pruned on startup / `!clean` when older than `WEBSIM_PROJECT_CACHE_MAX_AGE_HOURS`.
-- Owner/admin command `!safemode` (alias `!safe`) publishes a default page that says: “Something went wrong... Images and Videos are currently disabled for the time being, sorry!” It does not toggle off; use `!revert <version>` to restore a previous revision.
+- Owner/admin command `!safemode on` (alias `!safe on`) publishes a default page that says: “Something went wrong... Images and Videos are currently disabled for the time being, sorry!” `!safemode off` restores the previously recorded live revision when known; otherwise use `!revisions` and `!revert <version>`.
 - Your `WEBSIM_BEARER` JWT in `.env` is a **live login** for your websim account. Treat it like a password.
 - The agent can create, edit, publish, and delete revisions and comments. Point it only at projects you own.
 - `AGENT_MAX_TURNS` (default 15) prevents infinite tool-calling loops.

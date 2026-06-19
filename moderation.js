@@ -1,27 +1,45 @@
 const fs = require('fs');
 const os = require('os');
+const net = require('net');
+const dns = require('dns').promises;
 const nodePath = require('path');
 const { spawnSync } = require('child_process');
 
 const DEFAULT_ENDPOINT = 'https://imgcheck.val.run';
-const DEFAULT_MAX_MEDIA_BYTES = 500 * 1024 * 1024;
-const DEFAULT_MAX_VIDEO_SECONDS = 30 * 60;
+const DEFAULT_MAX_MEDIA_BYTES = 25 * 1024 * 1024;
+const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const DEFAULT_MAX_VIDEO_BYTES = 25 * 1024 * 1024;
+const DEFAULT_MAX_VIDEO_SECONDS = 60;
+const DEFAULT_MAX_MEDIA_URLS = 8;
+const DEFAULT_MODERATION_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const BLOCKED_CLASSES = new Set(['Sexy', 'Porn', 'Hentai']);
 const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|avif)(?:[?#][^\s"'<>)]*)?$/i;
 const VIDEO_EXT_RE = /\.(mp4|webm|mov|m4v|avi|mkv)(?:[?#][^\s"'<>)]*)?$/i;
 const URL_RE = /https?:\/\/[^\s"'<>)]*/gi;
 
 const BLOCK_MESSAGE = 'Blocked for user safety (Please note: this detection is not 100 percent accurate. This affects prompts with images and videos. In the future, a new filtering system might be added, but for now, please understand not all images and videos will be allowed through.)';
+const moderationCache = new Map();
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 function moderationConfig(env = process.env) {
+  const maxMediaBytes = parsePositiveInt(env.WEBSIM_MAX_MEDIA_BYTES, DEFAULT_MAX_MEDIA_BYTES);
   return {
     enabled: env.WEBSIM_MEDIA_MODERATION !== 'false',
     endpoint: (env.WEBSIM_MEDIA_MODERATION_ENDPOINT || DEFAULT_ENDPOINT).replace(/\/+$/, ''),
     threshold: Number.parseFloat(env.WEBSIM_MEDIA_MODERATION_THRESHOLD || '0.55'),
-    videoFrames: Number.parseInt(env.WEBSIM_VIDEO_MODERATION_FRAMES || '5', 10),
-    timeoutMs: Number.parseInt(env.WEBSIM_MEDIA_MODERATION_TIMEOUT_MS || '15000', 10),
-    maxMediaBytes: Number.parseInt(env.WEBSIM_MAX_MEDIA_BYTES || String(DEFAULT_MAX_MEDIA_BYTES), 10),
-    maxVideoSeconds: Number.parseInt(env.WEBSIM_MAX_VIDEO_SECONDS || String(DEFAULT_MAX_VIDEO_SECONDS), 10),
+    videoFrames: Math.min(parsePositiveInt(env.WEBSIM_VIDEO_MODERATION_FRAMES, 3), 5),
+    timeoutMs: parsePositiveInt(env.WEBSIM_MEDIA_MODERATION_TIMEOUT_MS, 8000),
+    maxMediaBytes,
+    maxImageBytes: Math.min(parsePositiveInt(env.WEBSIM_MAX_IMAGE_BYTES, DEFAULT_MAX_IMAGE_BYTES), maxMediaBytes),
+    maxVideoBytes: Math.min(parsePositiveInt(env.WEBSIM_MAX_VIDEO_BYTES, DEFAULT_MAX_VIDEO_BYTES), maxMediaBytes),
+    maxVideoSeconds: parsePositiveInt(env.WEBSIM_MAX_VIDEO_SECONDS, DEFAULT_MAX_VIDEO_SECONDS),
+    maxMediaUrls: parsePositiveInt(env.WEBSIM_MAX_MEDIA_URLS, DEFAULT_MAX_MEDIA_URLS),
+    cacheTtlMs: parsePositiveInt(env.WEBSIM_MODERATION_CACHE_TTL_SECONDS, DEFAULT_MODERATION_CACHE_TTL_MS / 1000) * 1000,
+    allowPrivateHosts: env.WEBSIM_ALLOW_PRIVATE_MEDIA_HOSTS === 'true',
   };
 }
 
@@ -49,9 +67,58 @@ function extractDataImages(text) {
   return [...String(text).matchAll(re)].map((m, i) => ({ type: 'image-data', label: `inline-image-${i + 1}`, buffer: Buffer.from(m[2], 'base64') }));
 }
 
+function cacheKey(type, url) { return `${type}:${url}`; }
+function getCached(type, url, cfg) {
+  const hit = moderationCache.get(cacheKey(type, url));
+  if (!hit) return null;
+  if (Date.now() - hit.at > cfg.cacheTtlMs) { moderationCache.delete(cacheKey(type, url)); return null; }
+  return hit.result;
+}
+function setCached(type, url, result) { moderationCache.set(cacheKey(type, url), { at: Date.now(), result }); }
+
 function isUnsafeClassification(classes, threshold) {
   const hit = (classes || []).find((c) => BLOCKED_CLASSES.has(c.className) && Number(c.probability) >= threshold);
   return hit ? { unsafe: true, className: hit.className, probability: hit.probability } : { unsafe: false };
+}
+
+function isPrivateIp(ip) {
+  if (net.isIPv4(ip)) {
+    const p = ip.split('.').map(Number);
+    return p[0] === 10 || p[0] === 127 || (p[0] === 169 && p[1] === 254) || (p[0] === 172 && p[1] >= 16 && p[1] <= 31) || (p[0] === 192 && p[1] === 168) || p[0] === 0;
+  }
+  const v = ip.toLowerCase();
+  return v === '::1' || v.startsWith('fc') || v.startsWith('fd') || v.startsWith('fe80:') || v === '::';
+}
+
+async function validateRemoteUrl(rawUrl, cfg) {
+  let parsed;
+  try { parsed = new URL(rawUrl); } catch { throw new Error('invalid URL'); }
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error(`unsupported protocol ${parsed.protocol}`);
+  if (!cfg.allowPrivateHosts) {
+    const records = await dns.lookup(parsed.hostname, { all: true, verbatim: true });
+    if (records.some((r) => isPrivateIp(r.address))) throw new Error('private/local media hosts are blocked');
+  }
+}
+
+function mediaTypeMatches(type, contentType) {
+  const ct = String(contentType || '').toLowerCase().split(';', 1)[0].trim();
+  if (type === 'image') return ct.startsWith('image/');
+  if (type === 'video') return ct.startsWith('video/') || ct === 'application/octet-stream';
+  return false;
+}
+
+async function preflightRemoteMedia(url, type, cfg) {
+  await validateRemoteUrl(url, cfg);
+  const res = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(cfg.timeoutMs), redirect: 'follow' });
+  if (!res.ok) throw new Error(`HEAD failed (${res.status})`);
+  const lenHeader = res.headers.get('content-length');
+  const bytes = lenHeader ? Number.parseInt(lenHeader, 10) : null;
+  const contentType = res.headers.get('content-type') || '';
+  if (!mediaTypeMatches(type, contentType)) throw new Error(`unexpected content-type ${contentType || 'missing'}`);
+  if (!Number.isFinite(bytes)) throw new Error(`${type} size could not be verified`);
+  const max = type === 'video' ? cfg.maxVideoBytes : cfg.maxImageBytes;
+  if (bytes > max) throw new Error(`${type} is too large (${bytes} bytes > ${max} bytes)`);
+  return { bytes, contentType };
 }
 
 async function classifyImageUrl(url, cfg) {
@@ -73,60 +140,46 @@ async function classifyImageBuffer(buffer, cfg) {
   return JSON.parse(text);
 }
 
-function hasFfmpeg() {
-  return spawnSync('ffmpeg', ['-version'], { encoding: 'utf8' }).status === 0;
-}
+function hasFfmpeg() { return spawnSync('ffmpeg', ['-version'], { encoding: 'utf8' }).status === 0; }
+function hasFfprobe() { return spawnSync('ffprobe', ['-version'], { encoding: 'utf8' }).status === 0; }
 
-function hasFfprobe() {
-  return spawnSync('ffprobe', ['-version'], { encoding: 'utf8' }).status === 0;
-}
-
-async function getRemoteContentLength(url, timeoutMs) {
-  const res = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' });
-  if (!res.ok) throw new Error(`HEAD failed (${res.status})`);
-  const len = res.headers.get('content-length');
-  return len ? Number.parseInt(len, 10) : null;
-}
-
-async function enforceRemoteMediaLimits(url, type, cfg) {
-  let bytes = null;
-  try { bytes = await getRemoteContentLength(url, cfg.timeoutMs); }
-  catch (err) {
-    if (type === 'video') throw new Error(`video size could not be verified: ${err.message}`);
+async function downloadLimited(url, cfg, expectedBytes) {
+  const dir = await fs.promises.mkdtemp(nodePath.join(os.tmpdir(), 'websim-media-'));
+  const file = nodePath.join(dir, 'media');
+  const cleanup = () => fs.rmSync(dir, { recursive: true, force: true });
+  const res = await fetch(url, { signal: AbortSignal.timeout(cfg.timeoutMs), redirect: 'follow' });
+  if (!res.ok) { cleanup(); throw new Error(`download failed (${res.status})`); }
+  const ct = res.headers.get('content-type') || '';
+  if (!mediaTypeMatches('video', ct)) { cleanup(); throw new Error(`unexpected download content-type ${ct || 'missing'}`); }
+  let seen = 0;
+  const chunks = [];
+  for await (const chunk of res.body) {
+    seen += chunk.length;
+    if (seen > cfg.maxVideoBytes || (expectedBytes && seen > expectedBytes + 1024)) { cleanup(); throw new Error('video download exceeded verified size limit'); }
+    chunks.push(chunk);
   }
-  if (Number.isFinite(bytes) && bytes > cfg.maxMediaBytes) {
-    throw new Error(`media is too large (${bytes} bytes > ${cfg.maxMediaBytes} bytes)`);
-  }
-  if (type === 'video' && bytes === null) throw new Error('video size could not be verified');
+  await fs.promises.writeFile(file, Buffer.concat(chunks));
+  return { file, cleanup, bytes: seen };
 }
 
-function getVideoDurationSeconds(url) {
+function getLocalVideoDurationSeconds(filePath, cfg) {
   if (!hasFfprobe()) throw new Error('ffprobe unavailable for video duration check');
   const out = spawnSync('ffprobe', [
-    '-v', 'error',
-    '-show_entries', 'format=duration',
-    '-of', 'default=noprint_wrappers=1:nokey=1',
-    url,
-  ], { encoding: 'utf8', timeout: 30000 });
+    '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', filePath,
+  ], { encoding: 'utf8', timeout: Math.min(cfg.timeoutMs, 15000) });
   if (out.status !== 0) throw new Error((out.stderr || out.stdout || 'ffprobe failed').slice(0, 200));
   const seconds = Number.parseFloat(String(out.stdout || '').trim());
   if (!Number.isFinite(seconds)) throw new Error('video duration could not be parsed');
   return seconds;
 }
 
-async function extractVideoFrames(url, frameCount) {
+async function extractVideoFrames(filePath, frameCount, cfg) {
   if (!hasFfmpeg()) throw new Error('ffmpeg unavailable for video moderation');
   const dir = await fs.promises.mkdtemp(nodePath.join(os.tmpdir(), 'websim-video-frames-'));
   const pattern = nodePath.join(dir, 'frame-%03d.jpg');
   try {
     const fps = `fps=1/${Math.max(1, Math.floor(20 / Math.max(1, frameCount)))}`;
-    const out = spawnSync('ffmpeg', [
-      '-hide_banner', '-loglevel', 'error', '-y',
-      '-i', url,
-      '-vf', fps,
-      '-frames:v', String(frameCount),
-      pattern,
-    ], { encoding: 'utf8', timeout: 30000 });
+    const out = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', filePath, '-vf', fps, '-frames:v', String(frameCount), pattern], { encoding: 'utf8', timeout: Math.min(cfg.timeoutMs * 2, 20000) });
     if (out.status !== 0) throw new Error((out.stderr || out.stdout || 'ffmpeg failed').slice(0, 200));
     const files = (await fs.promises.readdir(dir)).filter((f) => f.endsWith('.jpg')).sort();
     return await Promise.all(files.map((f) => fs.promises.readFile(nodePath.join(dir, f))));
@@ -136,34 +189,46 @@ async function extractVideoFrames(url, frameCount) {
 }
 
 async function moderateImage(url, cfg) {
-  await enforceRemoteMediaLimits(url, 'image', cfg);
+  const cached = getCached('image', url, cfg); if (cached) return cached;
+  await preflightRemoteMedia(url, 'image', cfg);
   const classes = await classifyImageUrl(url, cfg);
   const verdict = isUnsafeClassification(classes, cfg.threshold);
-  return { ok: !verdict.unsafe, type: 'image', url, verdict, classes };
+  const result = { ok: !verdict.unsafe, type: 'image', url, verdict, classes };
+  setCached('image', url, result);
+  return result;
 }
 
 async function moderateImageBuffer(label, buffer, cfg) {
+  if (buffer.length > cfg.maxImageBytes) throw new Error(`inline image is too large (${buffer.length} bytes > ${cfg.maxImageBytes} bytes)`);
   const classes = await classifyImageBuffer(buffer, cfg);
   const verdict = isUnsafeClassification(classes, cfg.threshold);
   return { ok: !verdict.unsafe, type: 'image', url: label, verdict, classes };
 }
 
 async function moderateVideo(url, cfg) {
-  await enforceRemoteMediaLimits(url, 'video', cfg);
-  const duration = getVideoDurationSeconds(url);
-  if (duration > cfg.maxVideoSeconds) throw new Error(`video is too long (${Math.round(duration)}s > ${cfg.maxVideoSeconds}s)`);
-  const frames = await extractVideoFrames(url, cfg.videoFrames);
-  if (frames.length === 0) throw new Error('no frames extracted for video moderation');
-  let unsafe = 0;
-  const details = [];
-  for (let i = 0; i < frames.length; i++) {
-    const classes = await classifyImageBuffer(frames[i], cfg);
-    const verdict = isUnsafeClassification(classes, cfg.threshold);
-    if (verdict.unsafe) unsafe++;
-    details.push({ frame: i + 1, verdict });
+  const cached = getCached('video', url, cfg); if (cached) return cached;
+  const preflight = await preflightRemoteMedia(url, 'video', cfg);
+  const local = await downloadLimited(url, cfg, preflight.bytes);
+  try {
+    const duration = getLocalVideoDurationSeconds(local.file, cfg);
+    if (duration > cfg.maxVideoSeconds) throw new Error(`video is too long (${Math.round(duration)}s > ${cfg.maxVideoSeconds}s)`);
+    const frames = await extractVideoFrames(local.file, cfg.videoFrames, cfg);
+    if (frames.length === 0) throw new Error('no frames extracted for video moderation');
+    let unsafe = 0;
+    const details = [];
+    for (let i = 0; i < frames.length; i++) {
+      const classes = await classifyImageBuffer(frames[i], cfg);
+      const verdict = isUnsafeClassification(classes, cfg.threshold);
+      if (verdict.unsafe) unsafe++;
+      details.push({ frame: i + 1, verdict });
+    }
+    const ratio = unsafe / frames.length;
+    const result = { ok: ratio <= 0.5, type: 'video', url, durationSeconds: duration, unsafeFrames: unsafe, frames: frames.length, details };
+    setCached('video', url, result);
+    return result;
+  } finally {
+    local.cleanup();
   }
-  const ratio = unsafe / frames.length;
-  return { ok: ratio <= 0.5, type: 'video', url, durationSeconds: duration, unsafeFrames: unsafe, frames: frames.length, details };
 }
 
 async function moderateTextForMedia(text, options = {}) {
@@ -171,21 +236,18 @@ async function moderateTextForMedia(text, options = {}) {
   if (!cfg.enabled) return { ok: true, skipped: true, reason: 'disabled' };
   const media = extractMediaUrls(text);
   const inlineImages = extractDataImages(text);
+  if (media.length > cfg.maxMediaUrls) return { ok: false, reason: `too many media URLs (${media.length} > ${cfg.maxMediaUrls})`, message: BLOCK_MESSAGE, results: [] };
   if (media.length === 0 && inlineImages.length === 0) return { ok: true, checked: 0 };
 
   const results = [];
   for (const item of media) {
     try {
-      const result = item.type === 'video'
-        ? await moderateVideo(item.url, cfg)
-        : await moderateImage(item.url, cfg);
+      const result = item.type === 'video' ? await moderateVideo(item.url, cfg) : await moderateImage(item.url, cfg);
       results.push(result);
       if (!result.ok) return { ok: false, blocked: item.url, result, message: BLOCK_MESSAGE, results };
     } catch (err) {
-      if (item.type === 'video') {
-        return { ok: false, blocked: item.url, reason: `Video could not be verified: ${err.message}`, message: BLOCK_MESSAGE, results };
-      }
-      results.push({ ok: true, warning: `Image moderation failed open: ${err.message}`, url: item.url });
+      const label = item.type === 'video' ? 'Video' : 'Image';
+      return { ok: false, blocked: item.url, reason: `${label} could not be verified: ${err.message}`, message: BLOCK_MESSAGE, results };
     }
   }
 
@@ -203,8 +265,11 @@ module.exports = {
   BLOCKED_CLASSES,
   DEFAULT_ENDPOINT,
   DEFAULT_MAX_MEDIA_BYTES,
+  DEFAULT_MAX_IMAGE_BYTES,
+  DEFAULT_MAX_VIDEO_BYTES,
   DEFAULT_MAX_VIDEO_SECONDS,
   extractMediaUrls,
   moderateTextForMedia,
   moderationConfig,
+  preflightRemoteMedia,
 };

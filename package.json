@@ -7,7 +7,8 @@
     "agent": "node agent.js",
     "agent:chat": "node agent.js --interactive",
     "mcp": "node mcp-server.js",
-    "projects": "node agent.js --list-projects"
+    "projects": "node agent.js --list-projects",
+    "check": "node -c agent.js && node -c mcp-server.js && node -c moderation.js && node static-checks.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
