@@ -7,6 +7,7 @@ const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
 const fs = require('fs');
 const nodePath = require('path');
+const { spawn } = require('child_process');
 const { BLOCK_MESSAGE, moderateTextForMedia } = require('./moderation.js');
 require('dotenv').config();
 
@@ -295,6 +296,23 @@ function loadBotState() {
 }
 function saveBotState(state) { fs.writeFileSync(BOT_STATE_PATH, JSON.stringify(state, null, 2)); }
 
+function spawnRestart(projectAlias) {
+  const projectArg = projectAlias ? ` --project ${JSON.stringify(projectAlias)}` : '';
+  const cmd = `script -q -c "node agent.js --watch${projectArg}" /dev/null >> agent.log 2>&1 &`;
+  const child = spawn('sh', ['-lc', cmd], { cwd: __dirname, detached: true, stdio: 'ignore' });
+  child.unref();
+}
+
+async function performSelfRestart(projectAlias, state, reason = 'restart requested') {
+  console.log(`   🔄 Restarting daemon: ${reason}`);
+  state.currentlyProcessing = null;
+  state.restartRequested = null;
+  saveBotState(state);
+  await stopMCP();
+  spawnRestart(projectAlias);
+  setTimeout(() => process.exit(0), 250);
+}
+
 function recoverInterruptedProcessing(state, interruptedId) {
   if (!interruptedId) return 0;
   const queued = new Set((state.queue || []).map(item => item.commentId));
@@ -329,8 +347,9 @@ function bgDelete(projectAlias, commentId) {
 function isAdmin(author) { return ADMIN_USERNAMES.has(author); }
 
 function statusText(state) {
-  const currently = state.currentlyProcessing ? 'building now 🔨' : (state.paused ? 'paused ⏸️' : 'idle');
-  return `📊 **Status:** ${state.queue.length} in queue | ${state.checklist.length} built | Currently: ${currently}`;
+  const currently = state.restartRequested ? 'restart pending 🔄' : (state.currentlyProcessing ? 'building now 🔨' : (state.paused ? 'paused ⏸️' : 'idle'));
+  const maint = state.maintenanceMessage ? `\nMaintenance: ${state.maintenanceMessage.slice(0, 120)}` : '';
+  return `📊 **Status:** ${state.queue.length} in queue | ${state.checklist.length} built | Currently: ${currently}${maint}`;
 }
 
 function canSendPublicStatus(state, author) {
@@ -453,6 +472,42 @@ async function handleAdminCommand(content, comment, state) {
     saveBotState(state);
     bgReply(proj, comment.id, '▶️ **Build intake resumed.**');
     console.log('   ▶️ Admin resumed build intake');
+  } else if (cmd === '!maintenance' || cmd === '!maint') {
+    state.paused = true;
+    state.maintenanceMessage = argText || 'Maintenance is starting. The bot will be back soon.';
+    state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
+    saveBotState(state);
+    bgReply(proj, comment.id, `🛠️ **Maintenance starting.**\n\n${state.maintenanceMessage}\n\nNew build intake is paused for now.`);
+    console.log(`   🛠️ Maintenance mode: ${state.maintenanceMessage}`);
+  } else if (cmd === '!online' || cmd === '!back') {
+    state.paused = false;
+    state.maintenanceMessage = null;
+    state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
+    saveBotState(state);
+    bgReply(proj, comment.id, '✅ **Bot is back online.** Queue processing can continue.');
+    console.log('   ✅ Maintenance ended; bot back online');
+  } else if (cmd === '!restart') {
+    state.paused = true;
+    state.restartRequested = { at: new Date().toISOString(), by: comment.author?.username || 'admin' };
+    state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
+    saveBotState(state);
+    if (state.currentlyProcessing) {
+      bgReply(proj, comment.id, '🔄 **Restart queued.** I’ll finish the current build first, then restart and come back online.');
+      console.log('   🔄 Restart requested; waiting for current build to finish');
+    } else {
+      bgReply(proj, comment.id, '🔄 **Restarting now.** I’ll be back online in a moment.');
+      setTimeout(() => performSelfRestart(proj, state, 'admin command'), 2500);
+    }
+  } else if (cmd === '!clean') {
+    state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
+    saveBotState(state);
+    try {
+      const res = await mcpClient.callTool({ name: 'clean_project_cache', arguments: {} });
+      const text = res.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+      bgReply(proj, comment.id, `🧹 **Local cache cleaned.**\n${text}`);
+    } catch (err) {
+      bgReply(proj, comment.id, `❌ **Cache clean failed:** ${err.message.slice(0, 180)}`);
+    }
   } else if (cmd === '!queue') {
     const preview = state.queue.slice(0, 10).map((item, i) => `${i + 1}. @${item.author}: ${item.content.slice(0, 60)}`).join('\n') || 'Queue is empty.';
     state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
@@ -538,7 +593,7 @@ async function handleAdminCommand(content, comment, state) {
   } else if (cmd === '!help' || cmd === '!adminhelp') {
     state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
     saveBotState(state);
-    bgReply(proj, comment.id, `🛠️ **Admin commands**\n!clearqueue — clear waiting queue\n!pause / !resume — stop/start new build intake\n!queue — preview queue\n!drop <n> — remove queue item\n!revisions — show recent versions\n!safemode — publish safe-mode page\n!revert <version> — set live site to previous revision\n!ap <prompt> — admin override build, prompt not echoed`);
+    bgReply(proj, comment.id, `🛠️ **Admin commands**\n!clearqueue — clear waiting queue\n!pause / !resume — stop/start new build intake\n!maintenance <msg> / !online — public maintenance notices\n!restart — finish current item, restart, then come back\n!clean — clean local project cache\n!queue — preview queue\n!drop <n> — remove queue item\n!revisions — show recent versions\n!safemode — publish safe-mode page\n!revert <version> — set live site to previous revision\n!ap <prompt> — admin override build, prompt not echoed`);
   } else {
     console.log(`   ⚠️ Unknown admin command: ${cmd}`);
   }
@@ -612,6 +667,18 @@ async function processNextInQueue(projectAlias, state) {
   state.currentlyProcessing = null;
   saveBotState(state);
 
+  if (state.restartRequested) {
+    bgReply(projectAlias, item.commentId, '🔄 Current build finished. Restarting the bot now; queue will continue when I’m back online.');
+    await new Promise(r => setTimeout(r, 2500));
+    await performSelfRestart(projectAlias, state, 'admin restart after current build');
+    return;
+  }
+
+  if (state.paused) {
+    console.log('   ⏸️ Queue paused; not processing next item yet.');
+    return;
+  }
+
   // Process next + announce updated positions
   if (state.queue.length > 0) {
     console.log(`   📋 ${state.queue.length} remaining — announcing + processing next...`);
@@ -628,6 +695,7 @@ async function daemonLoop(projectAlias) {
   if (state.currentlyProcessing) state.currentlyProcessing = null;
   const recovered = recoverInterruptedProcessing(state, interruptedId);
   saveBotState(state);
+  mcpClient.callTool({ name: 'clean_project_cache', arguments: {} }).catch(() => {});
 
   const intSec = Math.round(CONFIG.watchIntervalMs / 1000);
   console.log(`\n🤖 Daemon v2.2 | Model: ${CONFIG.model} | Poll: ${intSec}s | Priority: @Endoxidev`);
@@ -677,7 +745,7 @@ async function pollAndEnqueue(projectAlias, state) {
       announceQueuePositions(projectAlias, state).catch(() => {});
     }
 
-    if (!state.currentlyProcessing && state.queue.length > 0) {
+    if (!state.paused && !state.currentlyProcessing && state.queue.length > 0) {
       await processNextInQueue(projectAlias, state);
     }
 

@@ -4,6 +4,8 @@ const nodePath = require('path');
 const { spawnSync } = require('child_process');
 
 const DEFAULT_ENDPOINT = 'https://imgcheck.val.run';
+const DEFAULT_MAX_MEDIA_BYTES = 500 * 1024 * 1024;
+const DEFAULT_MAX_VIDEO_SECONDS = 30 * 60;
 const BLOCKED_CLASSES = new Set(['Sexy', 'Porn', 'Hentai']);
 const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|avif)(?:[?#][^\s"'<>)]*)?$/i;
 const VIDEO_EXT_RE = /\.(mp4|webm|mov|m4v|avi|mkv)(?:[?#][^\s"'<>)]*)?$/i;
@@ -18,6 +20,8 @@ function moderationConfig(env = process.env) {
     threshold: Number.parseFloat(env.WEBSIM_MEDIA_MODERATION_THRESHOLD || '0.55'),
     videoFrames: Number.parseInt(env.WEBSIM_VIDEO_MODERATION_FRAMES || '5', 10),
     timeoutMs: Number.parseInt(env.WEBSIM_MEDIA_MODERATION_TIMEOUT_MS || '15000', 10),
+    maxMediaBytes: Number.parseInt(env.WEBSIM_MAX_MEDIA_BYTES || String(DEFAULT_MAX_MEDIA_BYTES), 10),
+    maxVideoSeconds: Number.parseInt(env.WEBSIM_MAX_VIDEO_SECONDS || String(DEFAULT_MAX_VIDEO_SECONDS), 10),
   };
 }
 
@@ -73,6 +77,43 @@ function hasFfmpeg() {
   return spawnSync('ffmpeg', ['-version'], { encoding: 'utf8' }).status === 0;
 }
 
+function hasFfprobe() {
+  return spawnSync('ffprobe', ['-version'], { encoding: 'utf8' }).status === 0;
+}
+
+async function getRemoteContentLength(url, timeoutMs) {
+  const res = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' });
+  if (!res.ok) throw new Error(`HEAD failed (${res.status})`);
+  const len = res.headers.get('content-length');
+  return len ? Number.parseInt(len, 10) : null;
+}
+
+async function enforceRemoteMediaLimits(url, type, cfg) {
+  let bytes = null;
+  try { bytes = await getRemoteContentLength(url, cfg.timeoutMs); }
+  catch (err) {
+    if (type === 'video') throw new Error(`video size could not be verified: ${err.message}`);
+  }
+  if (Number.isFinite(bytes) && bytes > cfg.maxMediaBytes) {
+    throw new Error(`media is too large (${bytes} bytes > ${cfg.maxMediaBytes} bytes)`);
+  }
+  if (type === 'video' && bytes === null) throw new Error('video size could not be verified');
+}
+
+function getVideoDurationSeconds(url) {
+  if (!hasFfprobe()) throw new Error('ffprobe unavailable for video duration check');
+  const out = spawnSync('ffprobe', [
+    '-v', 'error',
+    '-show_entries', 'format=duration',
+    '-of', 'default=noprint_wrappers=1:nokey=1',
+    url,
+  ], { encoding: 'utf8', timeout: 30000 });
+  if (out.status !== 0) throw new Error((out.stderr || out.stdout || 'ffprobe failed').slice(0, 200));
+  const seconds = Number.parseFloat(String(out.stdout || '').trim());
+  if (!Number.isFinite(seconds)) throw new Error('video duration could not be parsed');
+  return seconds;
+}
+
 async function extractVideoFrames(url, frameCount) {
   if (!hasFfmpeg()) throw new Error('ffmpeg unavailable for video moderation');
   const dir = await fs.promises.mkdtemp(nodePath.join(os.tmpdir(), 'websim-video-frames-'));
@@ -95,6 +136,7 @@ async function extractVideoFrames(url, frameCount) {
 }
 
 async function moderateImage(url, cfg) {
+  await enforceRemoteMediaLimits(url, 'image', cfg);
   const classes = await classifyImageUrl(url, cfg);
   const verdict = isUnsafeClassification(classes, cfg.threshold);
   return { ok: !verdict.unsafe, type: 'image', url, verdict, classes };
@@ -107,6 +149,9 @@ async function moderateImageBuffer(label, buffer, cfg) {
 }
 
 async function moderateVideo(url, cfg) {
+  await enforceRemoteMediaLimits(url, 'video', cfg);
+  const duration = getVideoDurationSeconds(url);
+  if (duration > cfg.maxVideoSeconds) throw new Error(`video is too long (${Math.round(duration)}s > ${cfg.maxVideoSeconds}s)`);
   const frames = await extractVideoFrames(url, cfg.videoFrames);
   if (frames.length === 0) throw new Error('no frames extracted for video moderation');
   let unsafe = 0;
@@ -118,7 +163,7 @@ async function moderateVideo(url, cfg) {
     details.push({ frame: i + 1, verdict });
   }
   const ratio = unsafe / frames.length;
-  return { ok: ratio <= 0.5, type: 'video', url, unsafeFrames: unsafe, frames: frames.length, details };
+  return { ok: ratio <= 0.5, type: 'video', url, durationSeconds: duration, unsafeFrames: unsafe, frames: frames.length, details };
 }
 
 async function moderateTextForMedia(text, options = {}) {
@@ -157,6 +202,8 @@ module.exports = {
   BLOCK_MESSAGE,
   BLOCKED_CLASSES,
   DEFAULT_ENDPOINT,
+  DEFAULT_MAX_MEDIA_BYTES,
+  DEFAULT_MAX_VIDEO_SECONDS,
   extractMediaUrls,
   moderateTextForMedia,
   moderationConfig,

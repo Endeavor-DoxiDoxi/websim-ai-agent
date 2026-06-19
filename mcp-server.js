@@ -19,7 +19,8 @@ const { z } = require('zod');
 const fs = require('fs');
 const os = require('os');
 const nodePath = require('path');
-const { moderateTextForMedia } = require('./moderation.js');
+const { spawnSync } = require('child_process');
+const { moderateTextForMedia, DEFAULT_MAX_MEDIA_BYTES } = require('./moderation.js');
 
 // ── Config loading ────────────────────────────────────────────────
 require('dotenv').config();
@@ -68,6 +69,11 @@ function getBearer(project) {
 
 const API_BASE = 'https://websim.com/api/v1';
 const PROJECT_DIR = nodePath.join(__dirname, 'project');
+const MAX_MEDIA_BYTES = Number.parseInt(process.env.WEBSIM_MAX_MEDIA_BYTES || String(DEFAULT_MAX_MEDIA_BYTES), 10);
+const PROJECT_CACHE_MAX_AGE_MS = Number.parseInt(process.env.WEBSIM_PROJECT_CACHE_MAX_AGE_HOURS || '24', 10) * 60 * 60 * 1000;
+const MAX_VIDEO_SECONDS = Number.parseInt(process.env.WEBSIM_MAX_VIDEO_SECONDS || String(30 * 60), 10);
+const MEDIA_FILE_RE = /\.(png|jpe?g|webp|gif|bmp|avif|mp4|webm|mov|m4v|avi|mkv)(?:$|[?#])/i;
+const VIDEO_FILE_RE = /\.(mp4|webm|mov|m4v|avi|mkv)(?:$|[?#])/i;
 
 const SAFE_MODE_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -109,6 +115,56 @@ function contentTypeFor(path) {
     txt: 'text/plain', svg: 'image/svg+xml', xml: 'application/xml',
   };
   return map[ext] || 'text/plain';
+}
+
+function isMediaPath(path) {
+  return MEDIA_FILE_RE.test(path);
+}
+
+function assertMediaSize(path, bytes, context) {
+  if (isMediaPath(path) && Number.isFinite(bytes) && bytes > MAX_MEDIA_BYTES) {
+    throw new Error(`${context} blocked: ${path} is too large (${bytes} bytes > ${MAX_MEDIA_BYTES} bytes)`);
+  }
+}
+
+function assertLocalVideoDuration(path, filePath) {
+  if (!VIDEO_FILE_RE.test(path)) return;
+  const out = spawnSync('ffprobe', [
+    '-v', 'error',
+    '-show_entries', 'format=duration',
+    '-of', 'default=noprint_wrappers=1:nokey=1',
+    filePath,
+  ], { encoding: 'utf8', timeout: 30000 });
+  if (out.status !== 0) throw new Error(`upload blocked: video duration could not be verified for ${path}`);
+  const seconds = Number.parseFloat(String(out.stdout || '').trim());
+  if (!Number.isFinite(seconds)) throw new Error(`upload blocked: video duration could not be parsed for ${path}`);
+  if (seconds > MAX_VIDEO_SECONDS) throw new Error(`upload blocked: ${path} is too long (${Math.round(seconds)}s > ${MAX_VIDEO_SECONDS}s)`);
+}
+
+async function cleanupProjectCache(maxAgeMs = PROJECT_CACHE_MAX_AGE_MS) {
+  const now = Date.now();
+  let deleted = 0, kept = 0, bytesFreed = 0;
+  async function walk(dir) {
+    let entries;
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const entry of entries) {
+      const full = nodePath.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+        try { await fs.promises.rmdir(full); } catch {}
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const st = await fs.promises.stat(full);
+      if (now - st.mtimeMs > maxAgeMs) {
+        await fs.promises.unlink(full);
+        deleted++; bytesFreed += st.size;
+      } else kept++;
+    }
+  }
+  await walk(PROJECT_DIR);
+  return { deleted, kept, bytesFreed };
 }
 
 async function uploadAsset(projectId, revision, path, content, token, isEdit) {
@@ -224,6 +280,7 @@ server.tool(
   },
   async ({ path, content, project: projectAlias }) => {
     const proj = getProject(projectAlias);
+    assertMediaSize(path, Buffer.byteLength(content, 'utf8'), 'write_file');
     const dest = nodePath.join(PROJECT_DIR, proj.alias, path);
     await fs.promises.mkdir(nodePath.dirname(dest), { recursive: true });
     await fs.promises.writeFile(dest, content, 'utf8');
@@ -313,6 +370,13 @@ server.tool(
   async ({ revision, path, project: projectAlias }) => {
     const proj = getProject(projectAlias);
     const url = `https://${proj.id}.c.websim.com/${path}?v=${revision}&raw=`;
+    if (isMediaPath(path)) {
+      const head = await fetch(url, { method: 'HEAD', headers: { accept: '*/*', referer: `https://websim.com/p/${proj.id}/${revision}` } });
+      if (head.ok) {
+        const headLen = head.headers.get('content-length');
+        if (headLen) assertMediaSize(path, Number.parseInt(headLen, 10), 'download');
+      }
+    }
     const res = await fetch(url, {
       headers: {
         accept: '*/*',
@@ -320,7 +384,10 @@ server.tool(
       },
     });
     if (!res.ok) throw new Error(`download failed (${res.status}): ${await res.text()}`);
+    const len = res.headers.get('content-length');
+    if (len) assertMediaSize(path, Number.parseInt(len, 10), 'download');
     const buf = Buffer.from(await res.arrayBuffer());
+    assertMediaSize(path, buf.length, 'download');
     const dest = nodePath.join(PROJECT_DIR, proj.alias, path);
     await fs.promises.mkdir(nodePath.dirname(dest), { recursive: true });
     await fs.promises.writeFile(dest, buf);
@@ -347,10 +414,19 @@ server.tool(
     const src = nodePath.join(PROJECT_DIR, proj.alias, path);
     let content;
     try {
-      content = await fs.promises.readFile(src);
-    } catch {
-      throw new Error(`upload failed: local file not found at ${src} — download or create it first`);
+      const st = await fs.promises.stat(src);
+      assertMediaSize(path, st.size, 'upload');
+      assertLocalVideoDuration(path, src);
+    } catch (err) {
+      if (err.code === 'ENOENT') throw new Error(`upload failed: local file not found at ${src} — download or create it first`);
+      throw err;
     }
+    try {
+      content = await fs.promises.readFile(src);
+    } catch (err) {
+      throw new Error(`upload failed: could not read ${src}: ${err.message}`);
+    }
+    assertMediaSize(path, content.length, 'upload');
     if (!skip_moderation && /\.(html?|css|js|mjs|jsx|tsx|json|md|txt)$/i.test(path)) {
       const moderation = await moderateTextForMedia(content.toString('utf8'));
       if (!moderation.ok) throw new Error(moderation.message || 'Blocked for user safety');
@@ -358,6 +434,19 @@ server.tool(
     const exists = await assetExists(proj.id, revision, path, token);
     const out = await uploadAsset(proj.id, revision, path, content, token, exists);
     return { content: [{ type: 'text', text: `[${proj.alias}] ${exists ? 'Replaced' : 'Created'} ${path} (${content.length} bytes)` }] };
+  }
+);
+
+server.tool(
+  'clean_project_cache',
+  'Delete stale local project mirror files from project/. Does not affect Websim revisions.',
+  {
+    max_age_hours: z.number().int().optional().describe('Delete local cache files older than this many hours. Default from WEBSIM_PROJECT_CACHE_MAX_AGE_HOURS or 24.'),
+  },
+  async ({ max_age_hours }) => {
+    const maxAgeMs = Number.isInteger(max_age_hours) ? max_age_hours * 60 * 60 * 1000 : PROJECT_CACHE_MAX_AGE_MS;
+    const out = await cleanupProjectCache(maxAgeMs);
+    return { content: [{ type: 'text', text: `Cleaned local project cache: deleted=${out.deleted}, kept=${out.kept}, freed=${out.bytesFreed} bytes` }] };
   }
 );
 

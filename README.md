@@ -82,6 +82,9 @@ WEBSIM_MEDIA_MODERATION=true
 WEBSIM_MEDIA_MODERATION_ENDPOINT=https://imgcheck.val.run
 WEBSIM_MEDIA_MODERATION_THRESHOLD=0.55
 WEBSIM_VIDEO_MODERATION_FRAMES=5
+WEBSIM_MAX_MEDIA_BYTES=524288000
+WEBSIM_MAX_VIDEO_SECONDS=1800
+WEBSIM_PROJECT_CACHE_MAX_AGE_HOURS=24
 ```
 
 ### 3. Add your projects
@@ -277,7 +280,11 @@ Public commands:
 Admin commands are restricted to usernames in `WEBSIM_ADMIN_USERNAMES` and are best-effort deleted shortly after processing so the bot does not preserve sensitive command prompts in comments:
 
 - `!clearqueue` / `!clear` — clear waiting queue and notify queued users.
-- `!pause` / `!resume` — stop/start intake for new public build requests.
+- `!pause` / `!resume` — stop/start intake and queue processing for public build requests.
+- `!maintenance <message>` / `!maint <message>` — pause intake/queue and announce longer maintenance.
+- `!online` / `!back` — resume after maintenance and announce the bot is back online.
+- `!restart` — announce restart; if a prompt is currently building, finish it first, then restart and resume.
+- `!clean` — delete stale local project mirror/cache files.
 - `!queue` — show a short queue preview.
 - `!drop <n>` — remove one queued item by queue number.
 - `!revisions` / `!versions` — show recent revision numbers.
@@ -293,7 +300,9 @@ Admin commands are restricted to usernames in `WEBSIM_ADMIN_USERNAMES` and are b
 - Image/video URLs in comments are moderated before the AI sees the prompt. Blocked prompts receive a generic safety error.
 - Image/video URLs in uploaded HTML/CSS/JS/JSON/Markdown/text files are moderated before `upload_file` can publish them.
 - Default media moderation endpoint: `https://imgcheck.val.run` using nsfwjs classes. `Neutral` and `Drawing` are allowed; `Sexy`, `Porn`, and `Hentai` are blocked at `WEBSIM_MEDIA_MODERATION_THRESHOLD` or higher.
-- Video URLs are sampled with `ffmpeg` when available; if more than 50% of sampled frames are unsafe, the upload/request is blocked. If a video cannot be verified, it is blocked by default.
+- Image/video media is limited to `WEBSIM_MAX_MEDIA_BYTES` bytes (default 500MB) before download/upload where size can be verified.
+- Video URLs are checked with `ffprobe` and blocked if longer than `WEBSIM_MAX_VIDEO_SECONDS` (default 1800 seconds / 30 minutes), then sampled with `ffmpeg`; if more than 50% of sampled frames are unsafe, the upload/request is blocked. If a video cannot be verified, it is blocked by default.
+- Local project mirror files under `project/` are cache only and are pruned on startup / `!clean` when older than `WEBSIM_PROJECT_CACHE_MAX_AGE_HOURS`.
 - Owner/admin command `!safemode` (alias `!safe`) publishes a default page that says: “Something went wrong... Images and Videos are currently disabled for the time being, sorry!” It does not toggle off; use `!revert <version>` to restore a previous revision.
 - Your `WEBSIM_BEARER` JWT in `.env` is a **live login** for your websim account. Treat it like a password.
 - The agent can create, edit, publish, and delete revisions and comments. Point it only at projects you own.
