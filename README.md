@@ -301,6 +301,7 @@ Admin commands are restricted to usernames in `WEBSIM_ADMIN_USERNAMES` and are b
 - `!restart` — announce restart; if a prompt is currently building, finish it first, then restart and resume.
 - `!clean` — delete stale local project mirror/cache files.
 - `!fixindex [version]` / `!cleanindex [version]` — delete duplicate homepage assets such as `index (1).html`; keeps the real `index.html` untouched.
+- Local file mirror sync: successful publish/rollback pulls the live revision into `project/<alias>/` so future builds edit the same files that are live.
 - `!queue` — show a short queue preview.
 - `!drop <n>` — remove one queued item by queue number.
 - `!revisions` / `!versions` — show recent revision numbers.
@@ -331,6 +332,7 @@ This support does not relax media safety. Remote media in generated HTML still g
 - Your `WEBSIM_BEARER` JWT in `.env` is a **live login** for your websim account. Treat it like a password.
 - The agent can create, edit, publish, and delete revisions and comments. Point it only at projects you own.
 - Duplicate homepage paths such as `index (1).html` are blocked. The Websim entrypoint is `index.html`; use `!fixindex` if duplicates already exist on a revision.
+- Hyperframes/CSS/JS support files are auto-uploaded before `finish_revision` when they were staged locally, preventing incomplete published video compositions.
 - `AGENT_MAX_TURNS` (default 15) prevents infinite tool-calling loops.
 
 ### Notice

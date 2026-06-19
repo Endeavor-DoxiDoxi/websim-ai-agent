@@ -161,7 +161,7 @@ WORKFLOW:
 2. create_revision(parent_version=current live version) → draft
 3. download_file → read contents
 4. For small edits, prefer replace_in_file → stage exact local patches. Use write_file only when replacing/creating a whole file.
-5. upload_file → push
+5. upload_file → push every staged file needed by the page. If you write Hyperframes/CSS/JS/media support files, upload those too before publishing.
 6. finish_revision(revision=the newly created revision) → publish (MANDATORY!)
 7. set_current_revision(revision=that same newly created revision) → make live
 Stop and give 1-2 sentence summary.
@@ -174,6 +174,8 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions, branc
 
   const MUTATING = new Set(['upload_file', 'finish_revision', 'set_current_revision', 'delete_file', 'create_revision', 'replace_in_file']);
   let edited = false, published = false, publishRetries = 0, writtenFiles = [];
+  const stagedFiles = new Set();
+  const uploadedFiles = new Set();
   let buildRevision = null, finishedRevision = null, currentRevision = null, liveRevision = null;
 
   for (let turn = 0; turn < CONFIG.maxTurns; turn++) {
@@ -205,7 +207,7 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions, branc
       if (!args.project && projectAlias) args.project = projectAlias;
       if (adminOverride && name === 'upload_file') args.skip_moderation = true;
 
-      if (name === 'write_file' && args.path) { writtenFiles.push(args.path); edited = true; }
+      if (name === 'write_file' && args.path) { writtenFiles.push(args.path); stagedFiles.add(args.path); edited = true; }
 
       if (name === 'list_revisions') {
         // Parsed after the tool returns below; no-op here. Kept visible for publish-flow auditing.
@@ -243,12 +245,41 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions, branc
         continue;
       }
 
-      if (buildRevision && ['upload_file', 'finish_revision', 'set_current_revision', 'delete_file', 'replace_in_file'].includes(name) && (!Number.isInteger(args.revision) || args.revision !== buildRevision)) {
+      if (buildRevision && ['upload_file', 'finish_revision', 'set_current_revision', 'delete_file'].includes(name) && (!Number.isInteger(args.revision) || args.revision !== buildRevision)) {
         const result = `Error: refusing to ${name} revision ${args.revision}; this build owns newly-created revision ${buildRevision}. Use revision ${buildRevision}.`;
         console.error(`   🛑 ${result}`);
         messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
         messages.push({ role: 'user', content: `Use revision ${buildRevision} for all remaining upload/finish/set_current calls. Do not promote any other revision.` });
         continue;
+      }
+
+      if (name === 'finish_revision' && Number.isInteger(buildRevision)) {
+        const pendingUploads = [...stagedFiles].filter(path => !uploadedFiles.has(path));
+        if (pendingUploads.length > 0) {
+          console.log(`   📦 Auto-uploading staged files before finish: ${pendingUploads.join(', ')}`);
+          const uploadedNow = [];
+          let uploadError = null;
+          for (const path of pendingUploads) {
+            try {
+              const uploadRes = await mcpClient.callTool({ name: 'upload_file', arguments: { project: projectAlias, path, revision: buildRevision, skip_moderation: adminOverride } });
+              const uploadText = uploadRes.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+              uploadedFiles.add(path);
+              uploadedNow.push(`${path}: ${uploadText.slice(0, 120)}`);
+              console.log(`   ↳ auto-uploaded ${path}`);
+            } catch (err) {
+              uploadError = err;
+              break;
+            }
+          }
+          if (uploadError) {
+            const result = `Error: refusing to finish_revision because staged file upload failed: ${uploadError.message}. Uploaded before failure: ${uploadedNow.join(' | ') || 'none'}`;
+            console.error(`   🛑 ${result}`);
+            messages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+            messages.push({ role: 'user', content: 'Fix the staged file upload error, then finish and promote the same build revision.' });
+            continue;
+          }
+          messages.push({ role: 'user', content: `Auto-uploaded staged files before finish_revision: ${uploadedNow.join(' | ')}` });
+        }
       }
 
       if (MUTATING.has(name)) edited = true;
@@ -269,6 +300,8 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions, branc
           const m = result.match(/version=(\d+)/);
           if (m) buildRevision = Number.parseInt(m[1], 10);
         }
+        if ((name === 'write_file' || name === 'replace_in_file') && args.path && !result.startsWith('Error:')) stagedFiles.add(args.path);
+        if (name === 'upload_file' && args.path && !result.startsWith('Error:')) uploadedFiles.add(args.path);
         if (name === 'finish_revision' && args.revision === buildRevision) finishedRevision = args.revision;
         if (name === 'set_current_revision' && args.revision === buildRevision && finishedRevision === buildRevision) { currentRevision = args.revision; published = true; }
         console.log(`   ↳ ${result.slice(0, 200)}`);
@@ -655,23 +688,37 @@ async function handleAdminCommand(content, comment, state) {
       bgReply(proj, comment.id, `❌ **Safe mode failed:** ${err.message.slice(0, 180)}`);
       console.error(`   ❌ Safe mode failed: ${err.message}`);
     }
-  } else if (cmd === '!revert' || cmd === '!restore') {
+  } else if (cmd === '!revert' || cmd === '!restore' || cmd === '!rollback') {
     const version = Number.parseInt(rest[0], 10);
     state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
     saveBotState(state);
     if (!Number.isInteger(version) || version < 1) {
-      bgReply(proj, comment.id, 'Usage: `!revert <revision-number>`');
+      bgReply(proj, comment.id, 'Usage: `!revert <revision-number>` or `!rollback <revision-number>`');
       return;
     }
-    console.log(`   ↩️ Admin reverting live site to revision ${version}...`);
+    const cancelled = state.queue.length;
+    for (const item of state.queue) {
+      state.entries[item.commentId] = { id: item.commentId, category: 'cleared_for_rollback', at: new Date().toISOString(), author: item.author };
+    }
+    state.queue = [];
+    state.currentlyProcessing = null;
+    state.paused = true;
+    state.maintenanceMessage = `Rollback to revision ${version} in progress / completed. Use !online when ready to resume.`;
+    saveBotState(state);
+    console.log(`   ↩️ Admin rollback/revert to revision ${version}; cancelled ${cancelled} queued item(s)...`);
+    bgReply(proj, comment.id, WIP + `↩️ Rollback started. Paused intake and cancelled ${cancelled} queued item(s). Syncing local files to revision ${version}...`);
     try {
-      const res = await mcpClient.callTool({ name: 'set_current_revision', arguments: { project: proj, revision: version } });
+      const res = await mcpClient.callTool({ name: 'rollback_to_revision', arguments: { project: proj, revision: version, fallback_on_fail: true } });
       const text = res.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
-      bgReply(proj, comment.id, `✅ **Reverted live site to revision ${version}.**`);
-      console.log(`   ↩️ Revert complete: ${text}`);
+      state.lastRollback = { requestedRevision: version, at: new Date().toISOString(), result: text.slice(0, 500) };
+      saveBotState(state);
+      bgReply(proj, comment.id, `✅ **Rollback command finished.**\n${text}\n\nBuilds are still paused; use \`!online\` when you want the agent to resume.`);
+      console.log(`   ↩️ Rollback complete: ${text}`);
     } catch (err) {
-      bgReply(proj, comment.id, `❌ **Revert failed:** ${err.message.slice(0, 180)}`);
-      console.error(`   ❌ Revert failed: ${err.message}`);
+      state.lastRollback = { requestedRevision: version, at: new Date().toISOString(), error: err.message.slice(0, 500) };
+      saveBotState(state);
+      bgReply(proj, comment.id, `❌ **Rollback command failed:** ${err.message.slice(0, 180)}\n\nBuilds remain paused; use \`!revisions\` to choose a visible published revision, then try \`!rollback <version>\`.`);
+      console.error(`   ❌ Rollback failed: ${err.message}`);
     }
   } else if (cmd === '!revisions' || cmd === '!versions') {
     state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
@@ -708,7 +755,7 @@ async function handleAdminCommand(content, comment, state) {
   } else if (cmd === '!help' || cmd === '!adminhelp') {
     state.entries[comment.id] = { id: comment.id, category: 'admin', at: new Date().toISOString() };
     saveBotState(state);
-    bgReply(proj, comment.id, `🛠️ **Admin commands**\n!clearqueue — clear waiting queue\n!pause / !resume — stop/start new build intake\n!maintenance <msg> / !online — public maintenance notices\n!restart — finish current item, restart, then come back\n!clean — clean local project cache\n!fixindex [version] — delete duplicate index (n).html assets\n!queue — preview queue\n!drop <n> — remove queue item\n!revisions — show recent versions\n!safemode on/off — publish safe-mode page or restore previous live revision\n!revert <version> — set live site to previous revision\n!ap <prompt> — admin override build, prompt not echoed`);
+    bgReply(proj, comment.id, `🛠️ **Admin commands**\n!clearqueue — clear waiting queue\n!pause / !resume — stop/start new build intake\n!maintenance <msg> / !online — public maintenance notices\n!restart — finish current item, restart, then come back\n!clean — clean local project cache\n!fixindex [version] — delete duplicate index (n).html assets\n!queue — preview queue\n!drop <n> — remove queue item\n!revisions — show recent versions\n!safemode on/off — publish safe-mode page or restore previous live revision\n!revert <version> / !rollback <version> — pause, cancel queue, make version live, sync local files\n!ap <prompt> — admin override build, prompt not echoed`);
   } else {
     console.log(`   ⚠️ Unknown admin command: ${cmd}`);
     state.entries[comment.id] = { id: comment.id, category: 'admin', subcategory: 'unknown_command', at: new Date().toISOString(), author: comment.author?.username || 'admin' };
@@ -847,7 +894,7 @@ async function daemonLoop(projectAlias) {
 
   const intSec = Math.round(CONFIG.watchIntervalMs / 1000);
   console.log(`\n🤖 Daemon v2.2 | Model: ${CONFIG.model} | Poll: ${intSec}s | Priority: @Endoxidev`);
-  console.log(`   Queue: ${state.queue.length} | Built: ${state.checklist.length} | Admin: !clearqueue, !pause, !resume, !maintenance, !online, !restart, !clean, !fixindex, !queue, !drop, !revisions, !safemode on/off, !revert, !ap\n`);
+  console.log(`   Queue: ${state.queue.length} | Built: ${state.checklist.length} | Admin: !clearqueue, !pause, !resume, !maintenance, !online, !restart, !clean, !fixindex, !queue, !drop, !revisions, !safemode on/off, !revert/!rollback, !ap\n`);
   if (recovered > 0) console.log(`   ♻️ Recovered ${recovered} interrupted item(s) back into the queue.`);
 
   await pollAndEnqueue(projectAlias, state);

@@ -74,3 +74,12 @@ for (const needle of [
 ]) assert(hyperframesSample.includes(needle), `Hyperframes sample missing ${needle}`);
 
 console.log('static checks passed');
+
+
+assert(mcp.includes('sync_revision_to_local'), 'MCP must expose local mirror sync for revisions');
+assert(mcp.includes('rollback_to_revision'), 'MCP must expose atomic rollback + local sync');
+assert(mcp.includes('ROLLBACK_FAIL_HTML'), 'rollback failures must publish a visible fallback page');
+assert(mcp.includes('syncRevisionToLocal(proj, revision'), 'set_current_revision/rollback must sync local mirror');
+assert(agent.includes("cmd === '!rollback'"), 'agent must support !rollback alias');
+assert(agent.includes('cancelled') && agent.includes('rollback_to_revision'), 'rollback command must cancel queue and call rollback primitive');
+assert(agent.includes('Auto-uploading staged files before finish'), 'agent must upload staged support files before finishing revisions');

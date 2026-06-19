@@ -99,6 +99,27 @@ const SAFE_MODE_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+const ROLLBACK_FAIL_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rollback failed</title>
+  <style>
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: #160b0b; color: #fff3f3; font-family: system-ui, sans-serif; text-align: center; }
+    main { max-width: 720px; padding: 40px; border: 1px solid rgba(255,255,255,.2); border-radius: 24px; background: rgba(255,255,255,.08); }
+    h1 { font-size: clamp(2rem, 7vw, 4rem); margin: 0 0 12px; }
+    p { font-size: 1.2rem; line-height: 1.5; margin: 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Rollback fail</h1>
+    <p>Please try again.</p>
+  </main>
+</body>
+</html>`;
+
 // ── Helpers ───────────────────────────────────────────────────────
 
 function authHeaders(token) {
@@ -130,6 +151,10 @@ function assertSafeProjectPath(path) {
   if (nodePath.isAbsolute(path) || path.split(/[\\/]+/).includes('..')) {
     throw new Error(`blocked unsafe project path "${path}"`);
   }
+}
+
+function encodeProjectPath(path) {
+  return String(path).split('/').map(encodeURIComponent).join('/');
 }
 
 function assertMediaSize(path, bytes, context) {
@@ -235,6 +260,63 @@ async function listAssets(projectId, revision, token) {
   return data.assets || [];
 }
 
+async function fetchProjectFile(proj, revision, path, token) {
+  assertSafeProjectPath(path);
+  const url = `https://${proj.id}.c.websim.com/${encodeProjectPath(path)}?v=${revision}&raw=`;
+  const res = await fetch(url, {
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    headers: { accept: '*/*', referer: `https://websim.com/p/${proj.id}/${revision}` },
+  });
+  if (!res.ok) throw new Error(`download failed for ${path} (${res.status}): ${await res.text()}`);
+  const len = res.headers.get('content-length');
+  if (len) assertMediaSize(path, Number.parseInt(len, 10), 'download');
+  const buf = Buffer.from(await res.arrayBuffer());
+  assertMediaSize(path, buf.length, 'download');
+  return buf;
+}
+
+async function writeProjectMirrorFile(proj, path, buf) {
+  assertSafeProjectPath(path);
+  const dest = nodePath.join(PROJECT_DIR, proj.alias, path);
+  await fs.promises.mkdir(nodePath.dirname(dest), { recursive: true });
+  await fs.promises.writeFile(dest, buf);
+}
+
+async function syncRevisionToLocal(proj, revision, token) {
+  const meta = await getRevisionMeta(proj, revision, token);
+  if (!meta) throw new Error(`sync failed: revision ${revision} does not exist`);
+  if (meta.draft) throw new Error(`sync failed: revision ${revision} is still draft`);
+  const root = nodePath.join(PROJECT_DIR, proj.alias);
+  await fs.promises.rm(root, { recursive: true, force: true });
+  await fs.promises.mkdir(root, { recursive: true });
+
+  const downloaded = [];
+  const index = await fetchProjectFile(proj, revision, 'index.html', token);
+  await writeProjectMirrorFile(proj, 'index.html', index);
+  downloaded.push('index.html');
+
+  const assets = await listAssets(proj.id, revision, token);
+  for (const asset of assets) {
+    const path = asset.path;
+    if (!path || path === 'index.html' || DUPLICATE_INDEX_RE.test(path)) continue;
+    const buf = await fetchProjectFile(proj, revision, path, token);
+    await writeProjectMirrorFile(proj, path, buf);
+    downloaded.push(path);
+  }
+  return { downloaded, root };
+}
+
+async function publishRollbackFailurePage(proj, token, reason) {
+  const current = await getCurrentVersion(proj, token);
+  if (!Number.isInteger(current)) throw new Error(`rollback fallback failed: current live revision could not be determined after: ${reason}`);
+  const revision = await createDraftRevision(proj, current, token);
+  await createSiteForRevision(proj, revision, ROLLBACK_FAIL_HTML, token, `rollback failed: ${String(reason).slice(0, 200)}`);
+  await finishRevision(proj, revision, token);
+  await setCurrentRevision(proj, revision, token, { syncLocal: false });
+  await syncRevisionToLocal(proj, revision, token);
+  return revision;
+}
+
 async function getRevisionMeta(proj, revision, token) {
   const res = await fetch(`${API_BASE}/projects/${proj.id}/revisions`, { headers: authHeaders(token) });
   const text = await res.text();
@@ -281,7 +363,7 @@ async function finishRevision(proj, revision, token) {
   if (!meta || meta.draft) throw new Error(`finish_revision verification failed: revision ${revision} is not finalized`);
 }
 
-async function setCurrentRevision(proj, revision, token) {
+async function setCurrentRevision(proj, revision, token, options = {}) {
   const res = await fetch(
     `${API_BASE}/projects/${proj.id}`,
     {
@@ -294,6 +376,7 @@ async function setCurrentRevision(proj, revision, token) {
   if (!res.ok) throw new Error(`set_current_revision failed (${res.status}): ${text}`);
   const current = await getCurrentVersion(proj, token);
   if (current !== revision) throw new Error(`set_current_revision verification failed: live revision is ${current}, expected ${revision}`);
+  if (options.syncLocal !== false) await syncRevisionToLocal(proj, revision, token);
 }
 
 async function createSiteForRevision(proj, revision, content, token, message = 'websim agent index.html update') {
@@ -440,8 +523,9 @@ server.tool(
   async ({ revision, path, project: projectAlias }) => {
     assertSafeProjectPath(path);
     const proj = getProject(projectAlias);
-    const url = `https://${proj.id}.c.websim.com/${path}?v=${revision}&raw=`;
+    const token = getBearer(proj);
     if (isMediaPath(path)) {
+      const url = `https://${proj.id}.c.websim.com/${encodeProjectPath(path)}?v=${revision}&raw=`;
       const head = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), headers: { accept: '*/*', referer: `https://websim.com/p/${proj.id}/${revision}` } });
       if (!head.ok) throw new Error(`download blocked: could not preflight media ${path} (${head.status})`);
       const headLen = head.headers.get('content-length');
@@ -449,21 +533,8 @@ server.tool(
       if (!Number.isFinite(bytes)) throw new Error(`download blocked: media size could not be verified for ${path}`);
       assertMediaSize(path, bytes, 'download');
     }
-    const res = await fetch(url, {
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      headers: {
-        accept: '*/*',
-        referer: `https://websim.com/p/${proj.id}/${revision}`,
-      },
-    });
-    if (!res.ok) throw new Error(`download failed (${res.status}): ${await res.text()}`);
-    const len = res.headers.get('content-length');
-    if (len) assertMediaSize(path, Number.parseInt(len, 10), 'download');
-    const buf = Buffer.from(await res.arrayBuffer());
-    assertMediaSize(path, buf.length, 'download');
-    const dest = nodePath.join(PROJECT_DIR, proj.alias, path);
-    await fs.promises.mkdir(nodePath.dirname(dest), { recursive: true });
-    await fs.promises.writeFile(dest, buf);
+    const buf = await fetchProjectFile(proj, revision, path, token);
+    await writeProjectMirrorFile(proj, path, buf);
     // Return file contents so the LLM can edit them
     const previewLimit = 60000;
     const preview = buf.toString('utf8').slice(0, previewLimit);
@@ -525,6 +596,47 @@ server.tool(
     const maxAgeMs = Number.isInteger(max_age_hours) ? max_age_hours * 60 * 60 * 1000 : PROJECT_CACHE_MAX_AGE_MS;
     const out = await cleanupProjectCache(maxAgeMs);
     return { content: [{ type: 'text', text: `Cleaned local project cache: deleted=${out.deleted}, kept=${out.kept}, freed=${out.bytesFreed} bytes` }] };
+  }
+);
+
+server.tool(
+  'sync_revision_to_local',
+  'Delete the local project mirror and pull index.html plus all assets from a published revision. Use after rollback/revert or before debugging local state.',
+  {
+    revision: z.number().int().describe('Published project revision to sync locally.'),
+    project: projectParam,
+  },
+  async ({ revision, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const token = getBearer(proj);
+    const out = await syncRevisionToLocal(proj, revision, token);
+    return { content: [{ type: 'text', text: `[${proj.alias}] Synced revision ${revision} to ${out.root}: ${out.downloaded.join(', ')}` }] };
+  }
+);
+
+server.tool(
+  'rollback_to_revision',
+  'Pause-safe rollback primitive: set live revision, verify it, and sync the local project mirror. If requested, publish a rollback-failure page when rollback fails.',
+  {
+    revision: z.number().int().describe('Published project revision to make live.'),
+    fallback_on_fail: z.boolean().optional().describe('If true, publish a rollback-fail page when rollback cannot be completed. Default true.'),
+    project: projectParam,
+  },
+  async ({ revision, fallback_on_fail = true, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const token = getBearer(proj);
+    try {
+      const meta = await getRevisionMeta(proj, revision, token);
+      if (!meta) throw new Error(`revision ${revision} does not exist or is not visible`);
+      if (meta.draft) throw new Error(`revision ${revision} is still draft and cannot be made live`);
+      await setCurrentRevision(proj, revision, token);
+      const out = await syncRevisionToLocal(proj, revision, token);
+      return { content: [{ type: 'text', text: `[${proj.alias}] Rolled back live site to revision ${revision} and synced local mirror (${out.downloaded.length} files).` }] };
+    } catch (err) {
+      if (!fallback_on_fail) throw err;
+      const fallbackRevision = await publishRollbackFailurePage(proj, token, err.message);
+      return { content: [{ type: 'text', text: `[${proj.alias}] Rollback to revision ${revision} failed: ${err.message}. Published rollback-failure page at revision ${fallbackRevision} and synced local mirror.` }] };
+    }
   }
 );
 
