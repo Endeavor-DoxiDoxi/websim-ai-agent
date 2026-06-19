@@ -4,7 +4,7 @@ const assert = require('assert');
 
 const agent = fs.readFileSync('agent.js', 'utf8');
 const mcp = fs.readFileSync('mcp-server.js', 'utf8');
-const hyperframesSample = fs.readFileSync('examples/hyperframes-sample.html', 'utf8');
+const hyperframesSample = fs.readFileSync('examples/hyperframes-sample/index.html', 'utf8');
 const moderation = require('./moderation.js');
 
 const cfg = moderation.moderationConfig({});
