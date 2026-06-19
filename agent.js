@@ -368,6 +368,7 @@ async function performSelfRestart(projectAlias, state, reason = 'restart request
 }
 
 function recoverInterruptedProcessing(state, interruptedId) {
+  if (!interruptedId) return 0;
   const queued = new Set((state.queue || []).map(item => item.commentId));
   let recovered = 0;
   for (const entry of Object.values(state.entries || {})) {
@@ -858,7 +859,9 @@ async function daemonLoop(projectAlias) {
   const shutdown = async () => {
     if (closing) return; closing = true;
     clearInterval(pollTimer); clearInterval(announceTimer);
-    state.currentlyProcessing = null;
+    // Preserve currentlyProcessing on shutdown so the next boot can recover
+    // exactly that one interrupted item. Do not broaden recovery to older
+    // historical "processing" entries.
     saveBotState(state);
     await stopMCP();
     process.exit(0);

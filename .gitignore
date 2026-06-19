@@ -19,6 +19,7 @@ AGENT.md
 
 # agent state / runtime output
 comment-bot-seen.json
+comment-bot-seen.json*
 *.log
 *.pid
 *.bak

@@ -46,6 +46,9 @@ assert(mcp.includes('blocked duplicate homepage path'), 'MCP must block index (n
 assert(mcp.includes('delete_duplicate_index_files'), 'MCP must expose duplicate index cleanup tool');
 assert(agent.includes('!fixindex') && agent.includes('delete_duplicate_index_files'), 'agent must expose admin duplicate index cleanup');
 
+assert(agent.includes('if (!interruptedId) return 0;'), 'recovery must not requeue historical processing entries without an exact interrupted id');
+assert(agent.includes('Preserve currentlyProcessing on shutdown'), 'shutdown must preserve exact interrupted item for narrow recovery');
+
 const media = moderation.extractMediaUrls('x https://example.com/a.mp4 and https://example.com/b.jpg and ![](https://api.websim.com/blobs/abc123)');
 assert.deepStrictEqual(media.map(m => m.type), ['video', 'image', 'unknown']);
 const blockedScheme = moderation.extractMediaUrls('x ftp://example.com/a.mp4');
