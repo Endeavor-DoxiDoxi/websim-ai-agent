@@ -707,6 +707,20 @@ async function processNextInQueue(projectAlias, state) {
   const WIP = '⚠️ *Heads up — heavy work in progress! Pardon our dust.*\n\n';
   const comment = { id: item.commentId, content: item.content, raw_content: item.content, author: { username: item.author } };
 
+  // Re-check queued content with the current moderation rules. This catches items queued before a moderation hardening deploy.
+  const queuedModeration = await moderateTextForMedia(item.content);
+  if (!queuedModeration.ok) {
+    console.log(`   🛡️ @${item.author} blocked by queued media moderation: ${queuedModeration.blocked || queuedModeration.reason || 'unsafe media'}`);
+    state.entries[item.commentId].category = 'blocked_media';
+    state.entries[item.commentId].blockedAt = new Date().toISOString();
+    state.entries[item.commentId].blockReason = (queuedModeration.reason || queuedModeration.blocked || 'unsafe media').slice(0, 200);
+    state.currentlyProcessing = null;
+    saveBotState(state);
+    bgReply(projectAlias, item.commentId, BLOCK_MESSAGE);
+    if (!state.paused && state.queue.length > 0) await processNextInQueue(projectAlias, state);
+    return;
+  }
+
   // Triage
   console.log('   🧠 Reasoning...');
   let decision;
