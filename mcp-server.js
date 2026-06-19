@@ -136,6 +136,9 @@ function contentTypeFor(path) {
     html: 'text/html; charset=utf-8', css: 'text/css', js: 'text/javascript',
     mjs: 'text/javascript', json: 'application/json', md: 'text/markdown',
     txt: 'text/plain', svg: 'image/svg+xml', xml: 'application/xml',
+    mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+    m4v: 'video/mp4', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+    webp: 'image/webp', gif: 'image/gif', avif: 'image/avif',
   };
   return map[ext] || 'text/plain';
 }
@@ -177,6 +180,33 @@ function assertLocalVideoDuration(path, filePath) {
   if (seconds > MAX_VIDEO_SECONDS) throw new Error(`upload blocked: ${path} is too long (${Math.round(seconds)}s > ${MAX_VIDEO_SECONDS}s)`);
 }
 
+
+function videoEmbedHtml(videoPath, title = 'Rendered video') {
+  const safeTitle = String(title || 'Rendered video').replace(/[<&>]/g, ch => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[ch]));
+  const safeSrc = encodeProjectPath(videoPath);
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${safeTitle}</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #05070d; color: white; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 24px; background: radial-gradient(circle at top, #202a44, #05070d 60%); }
+    main { width: min(1100px, 100%); text-align: center; }
+    video { width: 100%; max-height: 82vh; border-radius: 24px; box-shadow: 0 28px 90px rgba(0,0,0,.55); background: #000; }
+    h1 { margin: 0 0 18px; font-size: clamp(1.8rem, 5vw, 4rem); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${safeTitle}</h1>
+    <video src="/${safeSrc}" controls autoplay loop playsinline></video>
+  </main>
+</body>
+</html>`;
+}
+
 async function cleanupProjectCache(maxAgeMs = PROJECT_CACHE_MAX_AGE_MS) {
   const now = Date.now();
   let deleted = 0, kept = 0, bytesFreed = 0;
@@ -204,7 +234,7 @@ async function cleanupProjectCache(maxAgeMs = PROJECT_CACHE_MAX_AGE_MS) {
 }
 
 async function uploadAsset(projectId, revision, path, content, token, existingAssetId = null) {
-  const body = Buffer.from(content, 'utf8');
+  const body = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
   const meta = { size: body.length };
   if (existingAssetId) meta.existingAssetId = existingAssetId;
 
@@ -540,6 +570,58 @@ server.tool(
     const preview = buf.toString('utf8').slice(0, previewLimit);
     const truncated = buf.length > previewLimit ? '\n... [truncated, full file on disk]' : '';
     return { content: [{ type: 'text', text: `[${proj.alias}] Downloaded ${path} (${buf.length} bytes)\n\nFILE CONTENTS:\n${preview}${truncated}` }] };
+  }
+);
+
+server.tool(
+  'render_hyperframes_video',
+  'Render a local Hyperframes composition directory to a real video file (MP4/WebM), optionally upload it to a draft revision, and optionally update index.html to play it with a normal <video> tag. Use this when the user wants a rendered video asset rather than an interactive Hyperframes runtime page.',
+  {
+    composition_dir: z.string().describe('Directory inside project/<alias>/ containing the Hyperframes composition index.html, e.g. "hyperframes" or ".".'),
+    output_path: z.string().optional().describe('Video path inside project/<alias>/ to write/upload. Default: assets/hyperframes-render.mp4'),
+    revision: z.number().int().optional().describe('Draft revision to upload the rendered video to. If omitted, only renders locally.'),
+    update_index: z.boolean().optional().describe('If true and revision is provided, writes/uploads index.html with a <video> tag pointing at the rendered asset.'),
+    title: z.string().optional().describe('Title used when update_index=true.'),
+    quality: z.enum(['draft', 'medium', 'high']).optional().describe('Hyperframes render quality. Default draft for speed.'),
+    timeout_seconds: z.number().int().optional().describe('Render timeout in seconds. Default 600.'),
+    project: projectParam,
+  },
+  async ({ composition_dir, output_path = 'assets/hyperframes-render.mp4', revision, update_index = false, title = 'Rendered video', quality = 'draft', timeout_seconds = 600, project: projectAlias }) => {
+    assertSafeProjectPath(composition_dir);
+    assertSafeProjectPath(output_path);
+    if (!/\.(mp4|webm)$/i.test(output_path)) throw new Error('render_hyperframes_video output_path must end in .mp4 or .webm');
+    const proj = getProject(projectAlias);
+    const token = revision ? getBearer(proj) : null;
+    const root = nodePath.join(PROJECT_DIR, proj.alias);
+    const compDir = nodePath.resolve(root, composition_dir);
+    const rootResolved = nodePath.resolve(root);
+    if (!(compDir === rootResolved || compDir.startsWith(rootResolved + nodePath.sep))) throw new Error('render blocked: composition_dir escapes project mirror');
+    if (!fs.existsSync(nodePath.join(compDir, 'index.html'))) throw new Error(`render blocked: ${composition_dir}/index.html does not exist`);
+    const outFile = nodePath.join(root, output_path);
+    await fs.promises.mkdir(nodePath.dirname(outFile), { recursive: true });
+    const args = ['--yes', 'hyperframes@0.6.112', 'render', compDir, '--quality', quality, '--output', outFile];
+    const proc = spawnSync('npx', args, { cwd: __dirname, encoding: 'utf8', timeout: Math.max(30, timeout_seconds) * 1000, maxBuffer: 1024 * 1024 * 8 });
+    if (proc.error) throw new Error(`hyperframes render failed: ${proc.error.message}`);
+    if (proc.status !== 0) throw new Error(`hyperframes render failed (${proc.status}): ${(proc.stderr || proc.stdout || '').slice(0, 4000)}`);
+    const st = await fs.promises.stat(outFile).catch(() => null);
+    if (!st || st.size <= 0) throw new Error('hyperframes render failed: output video was not created');
+    assertMediaSize(output_path, st.size, 'render');
+    assertLocalVideoDuration(output_path, outFile);
+    const uploaded = [];
+    if (Number.isInteger(revision)) {
+      const buf = await fs.promises.readFile(outFile);
+      const existingAssetId = await getAssetId(proj.id, revision, output_path, token);
+      await uploadAsset(proj.id, revision, output_path, buf, token, existingAssetId);
+      uploaded.push(output_path);
+      if (update_index) {
+        const html = videoEmbedHtml(output_path, title);
+        const indexPath = nodePath.join(root, 'index.html');
+        await fs.promises.writeFile(indexPath, html);
+        await createSiteForRevision(proj, revision, html, token, `embed rendered Hyperframes video ${output_path}`);
+        uploaded.push('index.html');
+      }
+    }
+    return { content: [{ type: 'text', text: `[${proj.alias}] Rendered Hyperframes composition ${composition_dir} → ${output_path} (${st.size} bytes)${uploaded.length ? `; uploaded ${uploaded.join(', ')} to revision ${revision}` : ''}` }] };
   }
 );
 

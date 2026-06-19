@@ -147,8 +147,10 @@ CONTENT SAFETY:
 `;
   const hyperframesSection = /\b(hyperframes?|video|mp4|rendered\s+clip|animation\s+video|promo\s+video|intro\s+video)\b/i.test(prompt) ? `
 HYPERFRAMES VIDEO SUPPORT:
-- For video-style site requests, use Hyperframes-style plain HTML compositions: data-composition-id, data-start, data-duration, data-width, data-height, seekable CSS/JS animations, and normal web media tracks.
-- Hyperframes is NOT an AI model. It is pure HTML video code / deterministic code-based video generation built from HTML/CSS/media/animations.
+- Hyperframes is NOT an AI model. It is deterministic HTML/CSS/media animation code that can either be published directly as an interactive composition OR rendered to a real video file.
+- Hyperframes compositions use plain HTML attributes such as data-composition-id, data-start, data-duration, data-width, data-height, seekable CSS/JS animations, and normal web media tracks.
+- Choose based on the request: if the user wants an actual playable/exported video, write a composition directory (for example hyperframes/index.html), call render_hyperframes_video to create/upload an MP4/WebM, then put a normal <video> element in index.html.
+- If the user wants interactive/HTML motion graphics, publishing Hyperframes-style HTML/JS/CSS directly is okay.
 - Keep generated video code teen-safe and avoid adding remote media unless clearly necessary and safe.
 ` : '';
 
@@ -161,7 +163,7 @@ WORKFLOW:
 2. create_revision(parent_version=current live version) → draft
 3. download_file → read contents
 4. For small edits, prefer replace_in_file → stage exact local patches. Use write_file only when replacing/creating a whole file.
-5. upload_file → push every staged file needed by the page. If you write Hyperframes/CSS/JS/media support files, upload those too before publishing.
+5. For rendered video requests, call render_hyperframes_video before publishing. Otherwise upload_file → push every staged file needed by the page.
 6. finish_revision(revision=the newly created revision) → publish (MANDATORY!)
 7. set_current_revision(revision=that same newly created revision) → make live
 Stop and give 1-2 sentence summary.
@@ -172,7 +174,7 @@ Project: "${projectAlias || 'default'}". Always start with list_revisions, branc
 
   console.log(`\n🤖 Building: "${prompt.slice(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
 
-  const MUTATING = new Set(['upload_file', 'finish_revision', 'set_current_revision', 'delete_file', 'create_revision', 'replace_in_file']);
+  const MUTATING = new Set(['upload_file', 'render_hyperframes_video', 'finish_revision', 'set_current_revision', 'delete_file', 'create_revision', 'replace_in_file']);
   let edited = false, published = false, publishRetries = 0, writtenFiles = [];
   const stagedFiles = new Set();
   const uploadedFiles = new Set();

@@ -83,3 +83,9 @@ assert(mcp.includes('syncRevisionToLocal(proj, revision'), 'set_current_revision
 assert(agent.includes("cmd === '!rollback'"), 'agent must support !rollback alias');
 assert(agent.includes('cancelled') && agent.includes('rollback_to_revision'), 'rollback command must cancel queue and call rollback primitive');
 assert(agent.includes('Auto-uploading staged files before finish'), 'agent must upload staged support files before finishing revisions');
+
+
+assert(mcp.includes('render_hyperframes_video'), 'MCP must render Hyperframes compositions to uploadable video files');
+assert(mcp.includes('Buffer.isBuffer(content)'), 'binary asset uploads must not be UTF-8 corrupted');
+assert(mcp.includes("mp4: 'video/mp4'"), 'video uploads must use video MIME types');
+assert(agent.includes('render_hyperframes_video'), 'agent prompt/tool flow must expose rendered Hyperframes video path');
