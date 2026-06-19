@@ -44,6 +44,15 @@ assert(mcp.includes('download blocked: media size could not be verified'), 'medi
 assert(mcp.includes('DUPLICATE_INDEX_RE'), 'MCP must detect duplicate index filenames');
 assert(mcp.includes('blocked duplicate homepage path'), 'MCP must block index (n).html paths');
 assert(mcp.includes('delete_duplicate_index_files'), 'MCP must expose duplicate index cleanup tool');
+
+assert(mcp.includes('existingAssetId'), 'uploads must use Websim official existingAssetId metadata');
+assert(mcp.includes('new File([body], path'), 'uploads must name the file by target path like websim-cli');
+assert(mcp.includes('/edit-assets'), 'deletes must use edit-assets endpoint so spaced paths work');
+
+assert(mcp.includes('createSiteForRevision'), 'index.html uploads must update Websim site content');
+assert(mcp.includes("path === 'index.html'"), 'upload_file must special-case canonical index.html');
+assert(mcp.includes('Updated site content from index.html'), 'index.html upload must report site-content update');
+assert(mcp.includes('safe mode homepage'), 'safe mode must update site content, not upload index asset');
 assert(agent.includes('!fixindex') && agent.includes('delete_duplicate_index_files'), 'agent must expose admin duplicate index cleanup');
 
 assert(agent.includes('if (!interruptedId) return 0;'), 'recovery must not requeue historical processing entries without an exact interrupted id');

@@ -178,14 +178,14 @@ async function cleanupProjectCache(maxAgeMs = PROJECT_CACHE_MAX_AGE_MS) {
   return { deleted, kept, bytesFreed };
 }
 
-async function uploadAsset(projectId, revision, path, content, token, isEdit) {
+async function uploadAsset(projectId, revision, path, content, token, existingAssetId = null) {
   const body = Buffer.from(content, 'utf8');
   const meta = { size: body.length };
-  if (isEdit) meta.existingAssetPath = path;
+  if (existingAssetId) meta.existingAssetId = existingAssetId;
 
   const form = new FormData();
   form.append('contents', JSON.stringify([meta]));
-  form.append('0', new Blob([body], { type: contentTypeFor(path) }), path);
+  form.append('0', new File([body], path, { type: contentTypeFor(path) }));
 
   const res = await fetch(
     `${API_BASE}/projects/${projectId}/revisions/${revision}/assets`,
@@ -204,6 +204,24 @@ async function assetExists(projectId, revision, path, token) {
   if (!res.ok) return false;
   const data = JSON.parse(await res.text());
   return (data.assets || []).some((a) => a.path === path);
+}
+
+async function getAssetId(projectId, revision, path, token) {
+  const assets = await listAssets(projectId, revision, token);
+  return assets.find((a) => a.path === path)?.id || null;
+}
+
+async function deleteAsset(projectId, revision, path, token) {
+  const res = await fetch(
+    `${API_BASE}/projects/${projectId}/revisions/${revision}/edit-assets`,
+    {
+      method: 'POST',
+      headers: { ...authHeaders(token), 'content-type': 'application/json' },
+      body: JSON.stringify({ operation: { type: 'delete', path } }),
+    }
+  );
+  const text = await res.text();
+  if (!res.ok) throw new Error(`delete_file failed (${res.status}): ${text}`);
 }
 
 async function listAssets(projectId, revision, token) {
@@ -276,6 +294,26 @@ async function setCurrentRevision(proj, revision, token) {
   if (!res.ok) throw new Error(`set_current_revision failed (${res.status}): ${text}`);
   const current = await getCurrentVersion(proj, token);
   if (current !== revision) throw new Error(`set_current_revision verification failed: live revision is ${current}, expected ${revision}`);
+}
+
+async function createSiteForRevision(proj, revision, content, token, message = 'websim agent index.html update') {
+  const meta = await getRevisionMeta(proj, revision, token);
+  if (!meta) throw new Error(`site update failed: revision ${revision} does not exist`);
+  const res = await fetch(`${API_BASE}/sites`, {
+    method: 'POST',
+    headers: { ...authHeaders(token), 'content-type': 'application/json' },
+    body: JSON.stringify({
+      project_id: meta.project_id,
+      project_version: meta.version,
+      project_revision_id: meta.id,
+      content,
+      prompt_data_override: { type: 'plaintext', text: message, data: null },
+    }),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`site update failed (${res.status}): ${text}`);
+  const body = JSON.parse(text);
+  return body.site?.id || body.id || null;
 }
 
 async function getCurrentVersion(proj, token) {
@@ -467,9 +505,13 @@ server.tool(
       const moderation = await moderateTextForMedia(content.toString('utf8'));
       if (!moderation.ok) throw new Error(moderation.message || 'Blocked for user safety');
     }
-    const exists = await assetExists(proj.id, revision, path, token);
-    const out = await uploadAsset(proj.id, revision, path, content, token, exists);
-    return { content: [{ type: 'text', text: `[${proj.alias}] ${exists ? 'Replaced' : 'Created'} ${path} (${content.length} bytes)` }] };
+    if (path === 'index.html') {
+      const siteId = await createSiteForRevision(proj, revision, content.toString('utf8'), token);
+      return { content: [{ type: 'text', text: `[${proj.alias}] Updated site content from index.html (${content.length} bytes${siteId ? `, site=${siteId}` : ''})` }] };
+    }
+    const existingAssetId = await getAssetId(proj.id, revision, path, token);
+    await uploadAsset(proj.id, revision, path, content, token, existingAssetId);
+    return { content: [{ type: 'text', text: `[${proj.alias}] ${existingAssetId ? 'Replaced' : 'Created'} ${path} (${content.length} bytes)` }] };
   }
 );
 
@@ -495,7 +537,9 @@ server.tool(
     const token = getBearer(proj);
     const parent = await getCurrentPublishedRevision(proj, token);
     const revision = await createDraftRevision(proj, parent, token);
-    await uploadAsset(proj.id, revision, 'index.html', SAFE_MODE_HTML, token, false);
+    await createSiteForRevision(proj, revision, SAFE_MODE_HTML, token, 'safe mode homepage');
+    const dupes = (await listAssets(proj.id, revision, token)).map(a => a.path).filter(p => DUPLICATE_INDEX_RE.test(p));
+    for (const path of dupes) await deleteAsset(proj.id, revision, path, token);
     await finishRevision(proj, revision, token);
     await setCurrentRevision(proj, revision, token);
     return { content: [{ type: 'text', text: `[${proj.alias}] Safe mode enabled at revision ${revision} (previous live revision ${parent})` }] };
@@ -514,12 +558,7 @@ server.tool(
     assertSafeProjectPath(path);
     const proj = getProject(projectAlias);
     const token = getBearer(proj);
-    const res = await fetch(
-      `${API_BASE}/projects/${proj.id}/revisions/${revision}/assets/${path}`,
-      { method: 'DELETE', headers: authHeaders(token) }
-    );
-    const text = await res.text();
-    if (!res.ok) throw new Error(`delete_file failed (${res.status}): ${text}`);
+    await deleteAsset(proj.id, revision, path, token);
     return { content: [{ type: 'text', text: `[${proj.alias}] Deleted ${path}` }] };
   }
 );
@@ -540,12 +579,7 @@ server.tool(
     const dupes = assets.map(a => a.path).filter(p => DUPLICATE_INDEX_RE.test(p));
     const deleted = [];
     for (const path of dupes) {
-      const res = await fetch(
-        `${API_BASE}/projects/${proj.id}/revisions/${targetRevision}/assets/${encodeURIComponent(path)}`,
-        { method: 'DELETE', headers: authHeaders(token) }
-      );
-      const text = await res.text();
-      if (!res.ok) throw new Error(`delete duplicate index failed for ${path} (${res.status}): ${text}`);
+      await deleteAsset(proj.id, targetRevision, path, token);
       deleted.push(path);
     }
     return { content: [{ type: 'text', text: `[${proj.alias}] Duplicate index cleanup on revision ${targetRevision}: deleted ${deleted.length}${deleted.length ? ` (${deleted.join(', ')})` : ''}` }] };
