@@ -709,7 +709,19 @@ async function processNextInQueue(projectAlias, state) {
 
   // Triage
   console.log('   🧠 Reasoning...');
-  const decision = await triageComment(comment);
+  let decision;
+  try {
+    decision = await triageComment(comment);
+  } catch (err) {
+    console.error(`   ❌ Triage failed: ${err.message}`);
+    state.entries[item.commentId].category = 'triage_error';
+    state.entries[item.commentId].buildError = err.message.slice(0, 200);
+    state.currentlyProcessing = null;
+    saveBotState(state);
+    bgReply(projectAlias, item.commentId, `${WIP}😅 Hit a temporary inference snag while checking this request. I’m moving on so the queue does not get stuck; please retry in a bit.`);
+    if (!state.paused && state.queue.length > 0) await processNextInQueue(projectAlias, state);
+    return;
+  }
   const emojis = { feature_request:'✨', bug_fix:'🐛', ui_change:'🎨', content_change:'✏️', question:'❓', praise:'❤️', spam:'🗑️', abuse:'🚫', greeting:'👋', unclear:'🤷' };
   console.log(`   ${emojis[decision.category]||'📌'} ${decision.category} → ${decision.actionable ? 'BUILD' : 'PASS'}`);
   console.log(`   ↳ ${decision.reasoning}`);

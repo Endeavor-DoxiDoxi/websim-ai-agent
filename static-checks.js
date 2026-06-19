@@ -19,6 +19,7 @@ assert(agent.includes('set_current_revision(revision=${buildRevision'), 'agent m
 assert(agent.includes('HYPERFRAMES_NOTICE'), 'agent must publicly note Hyperframes video generation');
 assert(agent.includes('!safemode on') && agent.includes('!safemode off'), 'safe mode must support explicit on/off syntax');
 assert(agent.includes('safeModePreviousRevision'), 'safe mode restore revision must be tracked');
+assert(agent.includes("category = 'triage_error'"), 'triage failures must not strand currentlyProcessing');
 assert(agent.includes("category: 'status'") && agent.includes("category: 'admin'"), 'status/admin commands must be marked as seen');
 
 assert(mcp.includes('getCurrentPublishedRevision'), 'safe mode must branch from current live revision');
